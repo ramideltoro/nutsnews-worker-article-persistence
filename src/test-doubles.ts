@@ -43,6 +43,9 @@ import type {
   PersistenceWorkTools
 } from "./dependencies.js";
 import { sha256Digest } from "./digest.js";
+import {
+  PersistenceTransientError
+} from "./errors.js";
 import { createFinalShadowMaterializationHandler } from "./materialization.js";
 import type {
   PersistenceBackendShadowAggregateCommand,
@@ -152,6 +155,8 @@ export class LocalFinalShadowTransactionRunner implements PersistenceFinalShadow
     "legacy_ingestion_tables"
   ];
   failNextRecord = false;
+  failNextCommit = false;
+  nextRecordError: Error | undefined;
   private readonly receipts = new Map<string, PersistenceFinalMaterializationRecord>();
   private readonly pendingWrites = new Map<string, LocalTransactionPendingWrites>();
 
@@ -187,6 +192,11 @@ export class LocalFinalShadowTransactionRunner implements PersistenceFinalShadow
     try {
       const result = await operation(transaction);
 
+      if (this.failNextCommit) {
+        this.failNextCommit = false;
+        throw new PersistenceTransientError("database-commit-lost");
+      }
+
       this.commit(pending);
       return result;
     } finally {
@@ -198,9 +208,16 @@ export class LocalFinalShadowTransactionRunner implements PersistenceFinalShadow
     transaction: PersistenceDatabaseTransaction,
     record: PersistenceFinalMaterializationRecord
   ): Promise<PersistenceFinalMaterializationWriteResult> {
+    if (this.nextRecordError !== undefined) {
+      const error = this.nextRecordError;
+
+      this.nextRecordError = undefined;
+      return Promise.reject(error);
+    }
+
     if (this.failNextRecord) {
       this.failNextRecord = false;
-      return Promise.reject(new Error("local final shadow write failed"));
+      return Promise.reject(new PersistenceTransientError("serialization-failure"));
     }
 
     const existingReceipt = this.receipts.get(record.request.idempotencyKey);
@@ -215,7 +232,8 @@ export class LocalFinalShadowTransactionRunner implements PersistenceFinalShadow
 
       return Promise.resolve({
         status: "duplicate",
-        aggregate: existingReceipt.aggregate
+        aggregate: existingReceipt.aggregate,
+        publicationReadinessCommand: existingReceipt.publicationReadinessCommand
       });
     }
 
@@ -314,6 +332,7 @@ export class LocalBackendWorkerApiClient implements PersistenceBackendWorkerApiC
   version = "worker-api-v1";
   readonly shadowAggregateCommands: PersistenceBackendShadowAggregateCommand[] = [];
   failNextShadowAggregate = false;
+  nextShadowAggregateError: Error | undefined;
   requiredScopes = [
     "worker:persistence:shadow",
     "worker:persistence:future-domain-command"
@@ -341,9 +360,16 @@ export class LocalBackendWorkerApiClient implements PersistenceBackendWorkerApiC
   }
 
   recordShadowAggregate(command: PersistenceBackendShadowAggregateCommand): PersistenceBackendShadowAggregateResult {
+    if (this.nextShadowAggregateError !== undefined) {
+      const error = this.nextShadowAggregateError;
+
+      this.nextShadowAggregateError = undefined;
+      throw error;
+    }
+
     if (this.failNextShadowAggregate) {
       this.failNextShadowAggregate = false;
-      throw new Error("local backend shadow aggregate API failed");
+      throw new PersistenceTransientError("backend-api-transient");
     }
 
     const payloadDigest = sha256Digest(command);
@@ -388,6 +414,7 @@ export class LocalPersistenceBrokerOutbox implements PersistenceBrokerOutbox {
   readonly name: string = "local-persistence-broker-outbox";
   status: PersistenceDependencyProbe["status"] = "ok";
   readonly records: { readonly command: BrokerPublishCommand; readonly receipt: BrokerPublishReceipt }[] = [];
+  failNextRecord = false;
 
   probe(): PersistenceDependencyProbe {
     return {
@@ -397,11 +424,20 @@ export class LocalPersistenceBrokerOutbox implements PersistenceBrokerOutbox {
   }
 
   record(command: BrokerPublishCommand, receipt: BrokerPublishReceipt): Promise<void> {
+    if (this.failNextRecord) {
+      this.failNextRecord = false;
+      return Promise.reject(new PersistenceTransientError("outbox-receipt-write-lost"));
+    }
+
     this.records.push({
       command,
       receipt
     });
     return Promise.resolve();
+  }
+
+  hasReceipt(command: BrokerPublishCommand): Promise<boolean> {
+    return Promise.resolve(this.records.some((record) => record.command.envelope.idempotencyKey === command.envelope.idempotencyKey));
   }
 }
 
@@ -429,6 +465,7 @@ export class LocalBrokerTransport implements RuntimeBrokerTransport {
   readonly inFlightDeliveryCount = 0;
   readonly assertedRoutes: WorkerRoute[] = [];
   readonly published: BrokerPublishCommand[] = [];
+  failNextPublish = false;
   private connected = false;
   private readonly consumers = new Map<WorkerStage, BrokerDeliveryHandler>();
 
@@ -445,6 +482,12 @@ export class LocalBrokerTransport implements RuntimeBrokerTransport {
 
   publish(command: BrokerPublishCommand): Promise<BrokerPublishReceipt> {
     this.assertConnected();
+
+    if (this.failNextPublish) {
+      this.failNextPublish = false;
+      return Promise.reject(new PersistenceTransientError("broker-publish-not-confirmed"));
+    }
+
     this.published.push(command);
     const route = getWorkerRoute(command.envelope.route);
 

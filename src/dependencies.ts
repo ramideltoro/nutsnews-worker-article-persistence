@@ -76,6 +76,7 @@ export interface PersistenceBrokerOutbox {
   readonly name: string;
   probe(): PersistenceDependencyProbe | Promise<PersistenceDependencyProbe>;
   record(command: BrokerPublishCommand, receipt: BrokerPublishReceipt): Promise<void>;
+  hasReceipt(command: BrokerPublishCommand): Promise<boolean>;
 }
 
 export interface PersistenceBackendApiCompatibility {

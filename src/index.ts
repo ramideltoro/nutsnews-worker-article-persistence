@@ -41,6 +41,13 @@ export type {
   PersistenceWorkTools
 } from "./dependencies.js";
 export {
+  PersistencePermanentError,
+  PersistenceProcessingError,
+  PersistenceTransientError,
+  classifyPersistenceError,
+  type PersistenceErrorClassification
+} from "./errors.js";
+export {
   FinalShadowMaterializationHandler,
   createFinalShadowMaterializationHandler
 } from "./materialization.js";
