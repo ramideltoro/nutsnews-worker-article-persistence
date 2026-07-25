@@ -129,6 +129,7 @@ export function createPersistenceService(options: PersistenceServiceOptions): Pe
           dependencyReadinessCheck("final-shadow-transactions", options.dependencies.finalShadowTransactions),
           dependencyReadinessCheck("stage-view-reader", options.dependencies.stageViewReader),
           dependencyReadinessCheck("broker-outbox", options.dependencies.brokerOutbox),
+          dependencyReadinessCheck("feed-health-projection-store", options.dependencies.feedHealthProjectionStore),
           dependencyReadinessCheck("backend-worker-api", options.dependencies.backendApiClient),
           finalShadowPermissionCheck(options),
           stageViewPermissionCheck(options),
