@@ -34,6 +34,7 @@ import type {
   PersistenceDatabaseTransaction,
   PersistenceDependencies,
   PersistenceDependencyProbe,
+  PersistenceFeedHealthProjectionStore,
   PersistenceFinalShadowTransactionRunner,
   PersistenceInboxStore,
   PersistenceInboxFingerprintResult,
@@ -46,7 +47,14 @@ import { sha256Digest } from "./digest.js";
 import {
   PersistenceTransientError
 } from "./errors.js";
-import { createFinalShadowMaterializationHandler } from "./materialization.js";
+import { createPersistenceRoutingWorkHandler } from "./feed-health-projection.js";
+import type {
+  FeedHealthLegacyRow,
+  FeedHealthProjectionEvent,
+  FeedHealthProjectionState,
+  FeedHealthProjectionWriteResult,
+  FeedQualityLegacyRow
+} from "./feed-health-types.js";
 import type {
   PersistenceBackendShadowAggregateCommand,
   PersistenceBackendShadowAggregateResult,
@@ -441,6 +449,237 @@ export class LocalPersistenceBrokerOutbox implements PersistenceBrokerOutbox {
   }
 }
 
+export class LocalFeedHealthProjectionStore implements PersistenceFeedHealthProjectionStore {
+  readonly name = "local-feed-health-projection-store";
+  status: PersistenceDependencyProbe["status"] = "ok";
+  readonly projectedEvents: FeedHealthProjectionEvent[] = [];
+  readonly staleEvents: FeedHealthProjectionEvent[] = [];
+  private readonly receipts = new Map<string, string>();
+  private readonly states = new Map<string, FeedHealthProjectionState>();
+
+  probe(): PersistenceDependencyProbe {
+    return {
+      status: this.status,
+      summary: this.status === "ok" ? "local feed-health projection store ready" : "local feed-health projection store degraded"
+    };
+  }
+
+  project(event: FeedHealthProjectionEvent): Promise<FeedHealthProjectionWriteResult> {
+    const existingDigest = this.receipts.get(event.idempotencyKey);
+
+    if (existingDigest !== undefined) {
+      if (existingDigest !== event.payloadDigest) {
+        return Promise.resolve({
+          status: "conflict",
+          reason: "feed-health-idempotency-conflict"
+        });
+      }
+
+      const state = this.states.get(event.feedKey) ?? createInitialFeedHealthState(event);
+      return Promise.resolve({
+        status: "duplicate",
+        state
+      });
+    }
+
+    const current = this.states.get(event.feedKey);
+
+    if (current !== undefined && event.eventVersion <= current.lastEventVersion) {
+      this.receipts.set(event.idempotencyKey, event.payloadDigest);
+      this.staleEvents.push(event);
+      return Promise.resolve({
+        status: "stale",
+        state: current
+      });
+    }
+
+    const next = applyFeedHealthEvent(current ?? createInitialFeedHealthState(event), event);
+
+    this.receipts.set(event.idempotencyKey, event.payloadDigest);
+    this.states.set(event.feedKey, next);
+    this.projectedEvents.push(event);
+    return Promise.resolve({
+      status: "projected",
+      state: next,
+      feedHealthRow: toFeedHealthLegacyRow(next),
+      feedQualityRow: toFeedQualityLegacyRow(next)
+    });
+  }
+
+  readLegacyFeedHealthRows(): Promise<readonly FeedHealthLegacyRow[]> {
+    return Promise.resolve(Array.from(this.states.values()).map(toFeedHealthLegacyRow));
+  }
+
+  readLegacyFeedQualityRows(): Promise<readonly FeedQualityLegacyRow[]> {
+    return Promise.resolve(Array.from(this.states.values()).map(toFeedQualityLegacyRow));
+  }
+}
+
+function createInitialFeedHealthState(event: FeedHealthProjectionEvent): FeedHealthProjectionState {
+  return {
+    feedKey: event.feedKey,
+    source: event.source,
+    feedUrl: event.feedUrl,
+    lastEventVersion: 0,
+    lastStatus: "duplicate",
+    lastItemCount: 0,
+    lastDuplicateCount: 0,
+    lastImageCount: 0,
+    lastEligibleCount: 0,
+    lastRejectedCount: 0,
+    lastAcceptedCount: 0,
+    consecutiveFailureCount: 0,
+    totalFetchCount: 0,
+    totalSuccessCount: 0,
+    totalFailureCount: 0,
+    totalItemCount: 0,
+    totalDuplicateCount: 0,
+    totalImageCount: 0,
+    totalEligibleCount: 0,
+    totalRejectedCount: 0,
+    totalAcceptedCount: 0,
+    totalLatencyMs: 0,
+    updatedAt: event.occurredAt,
+    backoffRecommendation: "none",
+    errorSamples: []
+  };
+}
+
+function applyFeedHealthEvent(
+  state: FeedHealthProjectionState,
+  event: FeedHealthProjectionEvent
+): FeedHealthProjectionState {
+  const isFetchAttempt = event.outcomeKind === "fetch_attempt";
+  const isFailure = event.outcomeStatus === "failure";
+  const isSuccess = event.outcomeStatus === "success";
+  const errorSample = event.errorClass === undefined
+    ? []
+    : [
+        {
+          occurredAt: event.occurredAt,
+          outcomeStage: event.outcomeStage,
+          outcomeKind: event.outcomeKind,
+          errorClass: event.errorClass
+        }
+      ];
+  const errorSamples = [
+    ...state.errorSamples,
+    ...errorSample
+  ].slice(-5);
+  const consecutiveFailureCount = isFailure
+    ? state.consecutiveFailureCount + 1
+    : isSuccess
+      ? 0
+      : state.consecutiveFailureCount;
+
+  return {
+    feedKey: state.feedKey,
+    source: event.source,
+    feedUrl: event.feedUrl,
+    lastEventVersion: event.eventVersion,
+    lastAttemptAt: event.occurredAt,
+    lastStatus: event.outcomeStatus,
+    lastItemCount: event.counts.itemCount,
+    lastDuplicateCount: event.counts.duplicateCount,
+    lastImageCount: event.counts.imageCount,
+    lastEligibleCount: event.counts.eligibleCount,
+    lastRejectedCount: event.counts.rejectedCount,
+    lastAcceptedCount: event.counts.acceptedCount,
+    consecutiveFailureCount,
+    totalFetchCount: state.totalFetchCount + (isFetchAttempt ? 1 : 0),
+    totalSuccessCount: state.totalSuccessCount + (isFetchAttempt && isSuccess ? 1 : 0),
+    totalFailureCount: state.totalFailureCount + (isFailure ? 1 : 0),
+    totalItemCount: state.totalItemCount + event.counts.itemCount,
+    totalDuplicateCount: state.totalDuplicateCount + event.counts.duplicateCount,
+    totalImageCount: state.totalImageCount + event.counts.imageCount,
+    totalEligibleCount: state.totalEligibleCount + event.counts.eligibleCount,
+    totalRejectedCount: state.totalRejectedCount + event.counts.rejectedCount,
+    totalAcceptedCount: state.totalAcceptedCount + event.counts.acceptedCount,
+    totalLatencyMs: state.totalLatencyMs + event.latencyMs,
+    updatedAt: event.occurredAt,
+    backoffRecommendation: event.backoffRecommendation,
+    errorSamples,
+    ...(isSuccess ? {
+      lastSuccessAt: event.occurredAt
+    } : state.lastSuccessAt === undefined ? {} : {
+      lastSuccessAt: state.lastSuccessAt
+    }),
+    ...(isFailure ? {
+      lastFailureAt: event.occurredAt,
+      lastErrorClass: event.errorClass ?? "unknown_failure"
+    } : {
+      ...(state.lastFailureAt === undefined ? {} : {
+        lastFailureAt: state.lastFailureAt
+      }),
+      ...(state.lastErrorClass === undefined ? {} : {
+        lastErrorClass: state.lastErrorClass
+      })
+    })
+  };
+}
+
+function toFeedHealthLegacyRow(state: FeedHealthProjectionState): FeedHealthLegacyRow {
+  return {
+    source: state.source,
+    feed_url: state.feedUrl,
+    last_checked_at: state.lastAttemptAt ?? state.updatedAt,
+    last_success_at: state.lastSuccessAt ?? null,
+    last_failure_at: state.lastFailureAt ?? null,
+    last_status: state.lastStatus,
+    last_error_message: state.lastErrorClass ?? null,
+    last_article_count: state.lastItemCount,
+    last_image_count: state.lastImageCount,
+    last_accepted_count: state.lastAcceptedCount,
+    last_rejected_count: state.lastRejectedCount,
+    consecutive_failure_count: state.consecutiveFailureCount,
+    total_fetch_count: state.totalFetchCount,
+    total_success_count: state.totalSuccessCount,
+    total_failure_count: state.totalFailureCount,
+    total_article_count: state.totalItemCount,
+    total_image_count: state.totalImageCount,
+    total_accepted_count: state.totalAcceptedCount,
+    total_rejected_count: state.totalRejectedCount,
+    updated_at: state.updatedAt
+  };
+}
+
+function toFeedQualityLegacyRow(state: FeedHealthProjectionState): FeedQualityLegacyRow {
+  const successRate = pct(state.totalSuccessCount, state.totalFetchCount);
+  const failureRate = pct(state.totalFailureCount, Math.max(1, state.totalFetchCount + state.totalFailureCount));
+  const duplicateRate = pct(state.totalDuplicateCount, state.totalItemCount + state.totalDuplicateCount);
+  const thumbnailRate = pct(state.totalImageCount, state.totalItemCount);
+  const acceptedRate = pct(state.totalAcceptedCount, state.totalEligibleCount);
+  const qualityScore = Math.max(0, Math.min(100, successRate + thumbnailRate + acceptedRate - failureRate - duplicateRate));
+
+  return {
+    source: state.source,
+    feed_url: state.feedUrl,
+    quality_score: round2(qualityScore),
+    success_rate: successRate,
+    thumbnail_rate: thumbnailRate,
+    accepted_rate: acceptedRate,
+    failure_rate: failureRate,
+    duplicate_rate: duplicateRate,
+    total_fetch_count: state.totalFetchCount,
+    total_success_count: state.totalSuccessCount,
+    total_failure_count: state.totalFailureCount,
+    total_article_count: state.totalItemCount,
+    total_image_count: state.totalImageCount,
+    total_accepted_count: state.totalAcceptedCount,
+    total_rejected_count: state.totalRejectedCount,
+    unique_reviewed_url_count: state.totalEligibleCount,
+    unique_published_url_count: state.totalAcceptedCount
+  };
+}
+
+function pct(numerator: number, denominator: number): number {
+  return denominator <= 0 ? 0 : round2((numerator / denominator) * 100);
+}
+
+function round2(value: number): number {
+  return Math.round(value * 100) / 100;
+}
+
 export class LocalPersistenceWorkHandler implements PersistenceWorkHandler {
   readonly name: string = "local-persistence-work-handler";
   readonly handled: RuntimeMessageContext[] = [];
@@ -602,6 +841,7 @@ export function createLocalPersistenceDependencies(options: {
     finalShadowTransactions: new LocalFinalShadowTransactionRunner(),
     stageViewReader: new LocalStageViewReader(),
     brokerOutbox: new LocalPersistenceBrokerOutbox(),
+    feedHealthProjectionStore: new LocalFeedHealthProjectionStore(),
     brokerTransport: new LocalBrokerTransport(),
     backendApiClient: new LocalBackendWorkerApiClient(),
     workHandler: options.workHandler ?? new LocalPersistenceWorkHandler()
@@ -613,7 +853,7 @@ export function createLocalPersistenceDependencies(options: {
 
   return {
     ...dependencies,
-    workHandler: createFinalShadowMaterializationHandler(dependencies)
+    workHandler: createPersistenceRoutingWorkHandler(dependencies)
   };
 }
 
@@ -723,6 +963,98 @@ export function createMinimalPersistenceDelivery(): RuntimeMessageDelivery {
   return {
     envelope: createMinimalPersistenceEnvelope(),
     payload: createMinimalPersistencePayload(),
+    receivedAt: "2026-07-23T00:00:01.000Z"
+  };
+}
+
+export function createMinimalFeedHealthProjectionEnvelope(overrides: Partial<WorkerMessageEnvelope> = {}): WorkerMessageEnvelope {
+  const route = getWorkerRoute("persistence");
+  const occurredAt = "2026-07-23T00:00:00.000Z";
+  const envelope = {
+    schemaId: route.schemaId,
+    schemaVersion: 1,
+    route: "persistence",
+    messageId: "018f1598-2dd5-7c4f-9f92-8f7a7f8b6801",
+    causationId: "018f1598-2dd5-7c4f-9f92-8f7a7f8b6701",
+    correlationId: "018f1598-2dd5-7c4f-9f92-8f7a7f8b6601",
+    traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+    idempotencyKey: "feed-health:example-feed:v1",
+    aggregate: {
+      type: "feed",
+      id: "example-feed",
+      version: 1
+    },
+    occurredAt,
+    attempt: {
+      count: 1,
+      max: WORKER_DELIVERY_BEHAVIOR.maxAttempts,
+      firstAttemptAt: occurredAt
+    },
+    producer: {
+      name: "fetcher",
+      version: "0.1.0"
+    },
+    payloadRef: {
+      kind: "backend-record",
+      uri: "backend://worker-uplift/projections/feed-health/example-feed/v1",
+      mediaType: "application/json",
+      sizeBytes: getStagePayloadSizeBytes(createMinimalFeedHealthProjectionPayload())
+    },
+    ...overrides
+  };
+
+  return assertWorkerEnvelope(envelope);
+}
+
+export function createMinimalFeedHealthProjectionPayload(
+  overrides: Readonly<Record<string, unknown>> = {}
+): Readonly<Record<string, unknown>> {
+  return {
+    schemaId: STAGE_PAYLOAD_SCHEMA_IDS.persistenceCommand,
+    schemaVersion: STAGE_PAYLOAD_SCHEMA_VERSION,
+    pipelineRunId: "018f1598-2dd5-7c4f-9f92-8f7a7f8b3601",
+    stageExecutionId: "018f1598-2dd5-7c4f-9f92-8f7a7f8b6702",
+    sourceMessageId: "018f1598-2dd5-7c4f-9f92-8f7a7f8b6701",
+    idempotencyKey: "feed-health:example-feed:v1",
+    traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+    producedAt: "2026-07-23T00:00:00.000Z",
+    commandId: "018f1598-2dd5-7c4f-9f92-8f7a7f8b6703",
+    commandKind: "save_feed_health",
+    backendOperation: "save-feed-health-batch",
+    entityRefs: [
+      {
+        projectionKind: "feed_health",
+        projectionId: "example-feed:v1",
+        feedKey: "example-feed",
+        feedUrl: "https://example.com/feed.xml",
+        source: "Example",
+        outcomeStage: "fetcher",
+        outcomeKind: "fetch_attempt",
+        outcomeStatus: "success",
+        eventVersion: 1,
+        occurredAt: "2026-07-23T00:00:00.000Z",
+        latencyMs: 250,
+        counts: {
+          itemCount: 10,
+          duplicateCount: 2,
+          imageCount: 8,
+          eligibleCount: 6,
+          rejectedCount: 1,
+          acceptedCount: 5
+        },
+        backoffRecommendation: "none"
+      }
+    ],
+    writeMode: "upsert",
+    providerMode: "backend_postgres_primary",
+    ...overrides
+  };
+}
+
+export function createMinimalFeedHealthProjectionDelivery(): RuntimeMessageDelivery {
+  return {
+    envelope: createMinimalFeedHealthProjectionEnvelope(),
+    payload: createMinimalFeedHealthProjectionPayload(),
     receivedAt: "2026-07-23T00:00:01.000Z"
   };
 }

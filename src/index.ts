@@ -33,6 +33,7 @@ export type {
   PersistenceDatabaseTransaction,
   PersistenceDependencies,
   PersistenceDependencyProbe,
+  PersistenceFeedHealthProjectionStore,
   PersistenceFinalShadowTransactionRunner,
   PersistenceInboxStore,
   PersistencePermissionProbe,
@@ -47,6 +48,25 @@ export {
   classifyPersistenceError,
   type PersistenceErrorClassification
 } from "./errors.js";
+export {
+  FeedHealthProjectionHandler,
+  PersistenceRoutingWorkHandler,
+  createFeedHealthProjectionHandler,
+  createPersistenceRoutingWorkHandler,
+  isFeedHealthProjectionPayload
+} from "./feed-health-projection.js";
+export type {
+  FeedHealthLegacyRow,
+  FeedHealthOutcomeKind,
+  FeedHealthOutcomeStage,
+  FeedHealthOutcomeStatus,
+  FeedHealthProjectionCounts,
+  FeedHealthProjectionErrorSample,
+  FeedHealthProjectionEvent,
+  FeedHealthProjectionState,
+  FeedHealthProjectionWriteResult,
+  FeedQualityLegacyRow
+} from "./feed-health-types.js";
 export {
   FinalShadowMaterializationHandler,
   createFinalShadowMaterializationHandler
@@ -81,6 +101,7 @@ export {
   InMemoryPersistenceInboxStore,
   LocalBackendWorkerApiClient,
   LocalBrokerTransport,
+  LocalFeedHealthProjectionStore,
   LocalFinalShadowTransactionRunner,
   LocalPersistenceBrokerOutbox,
   LocalPersistenceWorkHandler,
@@ -88,6 +109,9 @@ export {
   ManualPersistenceClock,
   createLocalFinalMaterializationInputs,
   createLocalPersistenceDependencies,
+  createMinimalFeedHealthProjectionDelivery,
+  createMinimalFeedHealthProjectionEnvelope,
+  createMinimalFeedHealthProjectionPayload,
   createMinimalPersistenceDelivery,
   createMinimalPersistenceEnvelope,
   createMinimalPersistencePayload

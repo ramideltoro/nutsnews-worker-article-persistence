@@ -8,6 +8,12 @@ import type {
   RuntimeMessageContext
 } from "@ramideltoro/nutsnews-worker-runtime";
 import type {
+  FeedHealthLegacyRow,
+  FeedHealthProjectionEvent,
+  FeedHealthProjectionWriteResult,
+  FeedQualityLegacyRow
+} from "./feed-health-types.js";
+import type {
   PersistenceBackendShadowAggregateCommand,
   PersistenceBackendShadowAggregateResult,
   PersistenceFinalMaterializationInputs,
@@ -79,6 +85,14 @@ export interface PersistenceBrokerOutbox {
   hasReceipt(command: BrokerPublishCommand): Promise<boolean>;
 }
 
+export interface PersistenceFeedHealthProjectionStore {
+  readonly name: string;
+  probe(): PersistenceDependencyProbe | Promise<PersistenceDependencyProbe>;
+  project(event: FeedHealthProjectionEvent): Promise<FeedHealthProjectionWriteResult>;
+  readLegacyFeedHealthRows(): Promise<readonly FeedHealthLegacyRow[]>;
+  readLegacyFeedQualityRows(): Promise<readonly FeedQualityLegacyRow[]>;
+}
+
 export interface PersistenceBackendApiCompatibility {
   readonly status: "ok" | "degraded" | "unhealthy";
   readonly summary: string;
@@ -113,6 +127,7 @@ export interface PersistenceDependencies {
   readonly finalShadowTransactions: PersistenceFinalShadowTransactionRunner;
   readonly stageViewReader: PersistenceStageViewReader;
   readonly brokerOutbox: PersistenceBrokerOutbox;
+  readonly feedHealthProjectionStore: PersistenceFeedHealthProjectionStore;
   readonly brokerTransport: RuntimeBrokerTransport;
   readonly backendApiClient: PersistenceBackendWorkerApiClient;
   readonly workHandler: PersistenceWorkHandler;
