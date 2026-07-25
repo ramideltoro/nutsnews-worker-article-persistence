@@ -218,7 +218,7 @@ describe("createPersistenceService", () => {
 
     await expect(context.broker.deliverPersistence(delivery)).resolves.toMatchObject({
       action: "retry",
-      reason: "handler-error"
+      reason: "backend-api-transient"
     });
 
     expect(context.finalShadow.materializations).toHaveLength(0);
@@ -246,7 +246,7 @@ describe("createPersistenceService", () => {
 
     await expect(context.broker.deliverPersistence(delivery)).resolves.toMatchObject({
       action: "retry",
-      reason: "handler-error"
+      reason: "serialization-failure"
     });
 
     expect(context.finalShadow.materializations).toHaveLength(0);

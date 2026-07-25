@@ -132,14 +132,14 @@ export class FinalShadowMaterializationHandler implements PersistenceWorkHandler
     });
 
     if (writeResult.status === "recorded") {
-      const receipt = await tools.publish(writeResult.publicationReadinessCommand);
-      await tools.recordOutbox(writeResult.publicationReadinessCommand, receipt);
+      await this.publishUnconfirmedReadiness(tools, writeResult.publicationReadinessCommand);
       return {
         status: "ok"
       };
     }
 
     if (writeResult.status === "duplicate") {
+      await this.publishUnconfirmedReadiness(tools, writeResult.publicationReadinessCommand);
       return {
         status: "ok"
       };
@@ -166,6 +166,18 @@ export class FinalShadowMaterializationHandler implements PersistenceWorkHandler
         diagnosticMetadata
       ));
     });
+  }
+
+  private async publishUnconfirmedReadiness(
+    tools: PersistenceWorkTools,
+    command: PersistenceFinalMaterializationRecord["publicationReadinessCommand"]
+  ): Promise<void> {
+    if (await this.dependencies.brokerOutbox.hasReceipt(command)) {
+      return;
+    }
+
+    const receipt = await tools.publish(command);
+    await tools.recordOutbox(command, receipt);
   }
 }
 

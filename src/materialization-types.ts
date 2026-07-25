@@ -154,6 +154,7 @@ export type PersistenceFinalMaterializationWriteResult =
   | {
       readonly status: "duplicate";
       readonly aggregate: PersistenceFinalShadowAggregate;
+      readonly publicationReadinessCommand: BrokerPublishCommand;
     }
   | {
       readonly status: "conflict" | "stale";

@@ -26,6 +26,10 @@ For each current article version, persistence builds the backend-approved `shado
 
 Exact replays return recorded success without duplicate aggregate/API/outbox side effects. Conflicting idempotency-key reuse, stale stage-result versions, and inconsistent stage references are quarantined with safe metadata only. Failed backend API calls or local transactions leave no accepted local aggregate/outbox delivery and remain retryable.
 
+## Replay And Fault Safety
+
+The local safety suite injects transient backend API failures, transaction write/commit failures, broker publish failures, outbox receipt failures, permanent permission-style failures, concurrent duplicate deliveries, and historical replay batches. Transient faults retry without duplicate visible aggregates. Permanent faults DLQ with safe diagnostics. If a crash occurs after final-shadow commit but before broker/outbox confirmation, replay republishes only the unconfirmed publication-readiness command.
+
 ## Configuration
 
 The HTTP server exposes `/config-schema` with names, defaults, sensitivity, and production requirements only. Runtime config records dependency presence booleans and never retains database URLs, RabbitMQ URLs, backend API URLs, or API tokens.

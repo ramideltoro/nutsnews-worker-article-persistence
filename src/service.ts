@@ -31,6 +31,7 @@ import type {
   PersistenceDependencyProbe
 } from "./dependencies.js";
 import { sha256Digest } from "./digest.js";
+import { classifyPersistenceError } from "./errors.js";
 import type {
   PersistenceQuarantineRecord
 } from "./materialization-types.js";
@@ -325,8 +326,15 @@ function createPersistenceInputProcessor(options: PersistenceInputProcessorOptio
       await markFailed(options.dependencies.inboxStore, envelope, result.reason, false, options.dependencies.clock);
       return terminalResult(envelope, result.reason);
     } catch (error: unknown) {
-      await markFailed(options.dependencies.inboxStore, envelope, classifyHandlerError(error), true, options.dependencies.clock);
-      return retryOrDlq(envelope, "handler-error");
+      const classification = classifyPersistenceError(error);
+
+      await markFailed(options.dependencies.inboxStore, envelope, classification.reason, classification.retryable, options.dependencies.clock);
+
+      if (classification.retryable) {
+        return retryOrDlq(envelope, classification.reason);
+      }
+
+      return terminalResult(envelope, classification.reason);
     }
   };
 }
@@ -572,14 +580,6 @@ async function markFailed(
     reason,
     retryable
   });
-}
-
-function classifyHandlerError(error: unknown): string {
-  if (error instanceof Error && error.name.length > 0) {
-    return error.name;
-  }
-
-  return "unknown-handler-error";
 }
 
 function createPayloadConflictQuarantineRecord(
