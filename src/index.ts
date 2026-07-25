@@ -41,6 +41,28 @@ export type {
   PersistenceWorkTools
 } from "./dependencies.js";
 export {
+  FinalShadowMaterializationHandler,
+  createFinalShadowMaterializationHandler
+} from "./materialization.js";
+export type {
+  PersistenceCanonicalStageResult,
+  PersistenceEnrichmentStageResult,
+  PersistenceApprovalStageResult,
+  PersistenceBackendShadowAggregateCommand,
+  PersistenceBackendShadowAggregateResult,
+  PersistenceFinalMaterializationAudit,
+  PersistenceFinalMaterializationInputs,
+  PersistenceFinalMaterializationRecord,
+  PersistenceFinalMaterializationRequest,
+  PersistenceFinalMaterializationWriteResult,
+  PersistenceFinalShadowAggregate,
+  PersistenceFinalStageResultReferences,
+  PersistenceQuarantineRecord,
+  PersistenceStageResultReference,
+  PersistenceTranslationStageResult,
+  PersistenceTranslationStageResultReference
+} from "./materialization-types.js";
+export {
   createPersistenceHttpServer,
   type PersistenceHttpServer
 } from "./http.js";
@@ -57,6 +79,7 @@ export {
   LocalPersistenceWorkHandler,
   LocalStageViewReader,
   ManualPersistenceClock,
+  createLocalFinalMaterializationInputs,
   createLocalPersistenceDependencies,
   createMinimalPersistenceDelivery,
   createMinimalPersistenceEnvelope,

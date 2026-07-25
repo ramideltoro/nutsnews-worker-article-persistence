@@ -18,6 +18,14 @@ This bootstrap establishes the persistence service runtime, health/metrics surfa
 - Uses a separate scoped backend API identity for shadow and future domain commands; broad direct writes to `public` domain tables are not represented in this service.
 - Contains no feed/page network access, AI generation, translation generation, publication decision logic, or legacy production writer logic.
 
+## Final Materialization
+
+The service consumes valid `persistenceCommand` messages whose entity reference declares `materializationKind: final_shadow_article`. The command carries durable canonicalizer, enrichment, approval, and translation stage-result references only; the service reads bodies through approved downstream views.
+
+For each current article version, persistence builds the backend-approved `shadowAggregate` shape and calls only the scoped `uplift-record-shadow-aggregate` Worker API command in `backend_postgres_shadow` mode. The final shadow aggregate, audit metadata, and publication-readiness outbox command are committed transactionally. Publication readiness is published only after that commit and the broker receipt is recorded separately.
+
+Exact replays return recorded success without duplicate aggregate/API/outbox side effects. Conflicting idempotency-key reuse, stale stage-result versions, and inconsistent stage references are quarantined with safe metadata only. Failed backend API calls or local transactions leave no accepted local aggregate/outbox delivery and remain retryable.
+
 ## Configuration
 
 The HTTP server exposes `/config-schema` with names, defaults, sensitivity, and production requirements only. Runtime config records dependency presence booleans and never retains database URLs, RabbitMQ URLs, backend API URLs, or API tokens.

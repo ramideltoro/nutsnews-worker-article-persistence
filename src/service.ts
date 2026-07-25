@@ -30,6 +30,10 @@ import type {
   PersistenceDependencies,
   PersistenceDependencyProbe
 } from "./dependencies.js";
+import { sha256Digest } from "./digest.js";
+import type {
+  PersistenceQuarantineRecord
+} from "./materialization-types.js";
 
 export interface PersistenceServiceOptions {
   readonly config: PersistenceConfig;
@@ -251,6 +255,29 @@ function createPersistenceInputProcessor(options: PersistenceInputProcessorOptio
           message: `Payload schema consumer ${payloadResult.definition.consumer} does not match persistence.`
         }
       ]);
+    }
+
+    const payloadFingerprint = sha256Digest({
+      aggregate: envelope.aggregate,
+      payload: payloadResult.value
+    });
+    const fingerprint = await options.dependencies.inboxStore.verifyPayloadFingerprint(envelope.idempotencyKey, payloadFingerprint);
+
+    if (fingerprint.status === "conflict") {
+      try {
+        await options.dependencies.finalShadowTransactions.withTransaction(async (transaction) => {
+          await options.dependencies.finalShadowTransactions.recordQuarantine(transaction, createPayloadConflictQuarantineRecord(
+            envelope,
+            payloadResult.value,
+            payloadFingerprint,
+            fingerprint.existingFingerprint
+          ));
+        });
+      } catch {
+        return retryOrDlq(envelope, "quarantine-record-error");
+      }
+
+      return terminalResult(envelope, "idempotency-payload-conflict");
     }
 
     const claim = await options.dependencies.inboxStore.claim(envelope.idempotencyKey, {
@@ -553,4 +580,43 @@ function classifyHandlerError(error: unknown): string {
   }
 
   return "unknown-handler-error";
+}
+
+function createPayloadConflictQuarantineRecord(
+  envelope: WorkerMessageEnvelope,
+  payload: Readonly<Record<string, unknown>>,
+  payloadFingerprint: string,
+  existingFingerprint: string
+): PersistenceQuarantineRecord {
+  const pipelineRunId = optionalString(payload.pipelineRunId);
+  const stageExecutionId = optionalString(payload.stageExecutionId);
+  const sourceMessageId = optionalString(payload.sourceMessageId);
+
+  return {
+    idempotencyKey: envelope.idempotencyKey,
+    messageId: envelope.messageId,
+    correlationId: envelope.correlationId,
+    articleId: envelope.aggregate.id,
+    articleVersion: envelope.aggregate.version,
+    reason: "idempotency-payload-conflict",
+    payloadDigest: payloadFingerprint,
+    diagnosticMetadata: {
+      existingFingerprint,
+      payloadFingerprint,
+      safeMetadataOnly: true
+    },
+    ...(pipelineRunId === undefined ? {} : {
+      pipelineRunId
+    }),
+    ...(stageExecutionId === undefined ? {} : {
+      stageExecutionId
+    }),
+    ...(sourceMessageId === undefined ? {} : {
+      sourceMessageId
+    })
+  };
+}
+
+function optionalString(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
 }

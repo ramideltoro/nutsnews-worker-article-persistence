@@ -7,15 +7,34 @@ import type {
   RuntimeIdempotencyStore,
   RuntimeMessageContext
 } from "@ramideltoro/nutsnews-worker-runtime";
+import type {
+  PersistenceBackendShadowAggregateCommand,
+  PersistenceBackendShadowAggregateResult,
+  PersistenceFinalMaterializationInputs,
+  PersistenceFinalMaterializationRecord,
+  PersistenceFinalMaterializationRequest,
+  PersistenceFinalMaterializationWriteResult,
+  PersistenceQuarantineRecord
+} from "./materialization-types.js";
 
 export interface PersistenceDependencyProbe {
   readonly status: "ok" | "degraded" | "unhealthy";
   readonly summary: string;
 }
 
+export type PersistenceInboxFingerprintResult =
+  | {
+      readonly status: "accepted" | "duplicate";
+    }
+  | {
+      readonly status: "conflict";
+      readonly existingFingerprint: string;
+    };
+
 export interface PersistenceInboxStore extends RuntimeIdempotencyStore {
   readonly name: string;
   probe(): PersistenceDependencyProbe | Promise<PersistenceDependencyProbe>;
+  verifyPayloadFingerprint(idempotencyKey: string, fingerprint: string): Promise<PersistenceInboxFingerprintResult>;
 }
 
 export interface PersistenceDatabaseTransaction {
@@ -37,12 +56,20 @@ export interface PersistenceFinalShadowTransactionRunner {
   probe(): PersistenceDependencyProbe | Promise<PersistenceDependencyProbe>;
   checkWriteScope(): PersistencePermissionProbe | Promise<PersistencePermissionProbe>;
   withTransaction<T>(operation: (transaction: PersistenceDatabaseTransaction) => Promise<T>): Promise<T>;
+  recordFinalMaterialization(
+    transaction: PersistenceDatabaseTransaction,
+    record: PersistenceFinalMaterializationRecord
+  ): Promise<PersistenceFinalMaterializationWriteResult>;
+  recordQuarantine(transaction: PersistenceDatabaseTransaction, record: PersistenceQuarantineRecord): Promise<void>;
 }
 
 export interface PersistenceStageViewReader {
   readonly name: string;
   probe(): PersistenceDependencyProbe | Promise<PersistenceDependencyProbe>;
   checkReadScope(): PersistencePermissionProbe | Promise<PersistencePermissionProbe>;
+  readFinalMaterializationInputs(
+    request: PersistenceFinalMaterializationRequest
+  ): PersistenceFinalMaterializationInputs | Promise<PersistenceFinalMaterializationInputs>;
 }
 
 export interface PersistenceBrokerOutbox {
@@ -63,6 +90,9 @@ export interface PersistenceBackendWorkerApiClient {
   readonly name: string;
   probe(): PersistenceDependencyProbe | Promise<PersistenceDependencyProbe>;
   checkCompatibility(expectedVersion: string): PersistenceBackendApiCompatibility | Promise<PersistenceBackendApiCompatibility>;
+  recordShadowAggregate(
+    command: PersistenceBackendShadowAggregateCommand
+  ): PersistenceBackendShadowAggregateResult | Promise<PersistenceBackendShadowAggregateResult>;
 }
 
 export interface PersistenceWorkTools {
