@@ -105,9 +105,10 @@ describe("persistence test doubles", () => {
       details: {
         allowedWriteScopes: [],
         allowedReadScopes: [
-          "worker_uplift.v_approval_decisions",
-          "worker_uplift.v_translation_results",
-          "worker_uplift.v_stage_worker_runs"
+          "worker_uplift_views.canonical_article_projection",
+          "worker_uplift_views.approval_projection",
+          "worker_uplift_views.translation_coverage_projection",
+          "worker_uplift_views.final_shadow_article_projection"
         ]
       }
     });

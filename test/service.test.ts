@@ -23,7 +23,8 @@ import {
   LocalPersistenceWorkHandler,
   LocalStageViewReader,
   createLocalPersistenceDependencies,
-  createMinimalPersistenceDelivery
+  createMinimalPersistenceDelivery,
+  createMinimalPersistencePayload
 } from "../src/test-doubles.js";
 
 describe("createPersistenceService", () => {
@@ -50,7 +51,7 @@ describe("createPersistenceService", () => {
     expect(context.telemetry.events.some((event) => event.name === "runtime.broker.state_changed")).toBe(true);
   });
 
-  it("delegates valid persistence deliveries and acks duplicate replays", async () => {
+  it("materializes valid persistence deliveries and acks duplicate replays without duplicate side effects", async () => {
     const context = createServiceContext();
     const delivery = createMinimalPersistenceDelivery();
 
@@ -65,11 +66,60 @@ describe("createPersistenceService", () => {
       reason: "duplicate"
     });
 
-    expect(context.workHandler.handled).toHaveLength(1);
-    expect(context.workHandler.handled[0]?.payload).toMatchObject({
-      schemaId: STAGE_PAYLOAD_SCHEMA_IDS.persistenceCommand,
-      commandKind: "save_summaries",
-      backendOperation: "save-article-summaries-batch"
+    expect(context.finalShadow.materializations).toHaveLength(1);
+    expect(context.finalShadow.aggregates).toHaveLength(1);
+    expect(context.finalShadow.audits).toHaveLength(1);
+    expect(context.backendApi.shadowAggregateCommands).toHaveLength(1);
+    expect(context.broker.published).toHaveLength(1);
+    expect(context.outbox.records).toHaveLength(1);
+    const shadowCommand = context.backendApi.shadowAggregateCommands[0];
+
+    expect(shadowCommand?.shadowAggregate.payloadDigest).toMatch(/^sha256:/);
+    expect(context.backendApi.shadowAggregateCommands[0]).toMatchObject({
+      operation: "uplift-record-shadow-aggregate",
+      providerMode: "backend_postgres_shadow",
+      actorService: "worker-uplift-persistence",
+      schemaVersion: 1,
+      operationVersion: 1,
+      expectedArticleVersion: 1,
+      shadowAggregate: {
+        articleIdentityHash: "article-hash-001",
+        canonicalUrlHash: "canonical-url-hash-001",
+        originalUrlHash: "original-url-hash-001",
+        aggregateVersion: 1,
+        titleRef: "backend://worker-uplift/enrichment/article-001/title/v1",
+        imageUrlRef: "backend://worker-uplift/enrichment/article-001/image/v1",
+        category: "Science",
+        positivityScore: 8.5,
+        approvalVersion: 1,
+        translationLanguages: [
+          "fr",
+          "ja"
+        ],
+        publicationStatus: "ready",
+        payloadRef: "backend://worker-uplift/final-shadow/article-hash-001/v1",
+        diagnosticMetadata: {
+          safeMetadataOnly: true,
+          approved: true,
+          acceptedLanguageCount: 2,
+          missingLanguageCount: 0
+        }
+      }
+    });
+    expect(context.broker.published[0]?.payload).toMatchObject({
+      schemaId: STAGE_PAYLOAD_SCHEMA_IDS.publicationReadiness,
+      readinessStatus: "ready",
+      articleId: "article-001",
+      requiredLanguageCodes: [
+        "fr",
+        "ja"
+      ],
+      availableLanguageCodes: [
+        "fr",
+        "ja"
+      ],
+      missingLanguageCodes: [],
+      snapshotRefreshRequired: true
     });
 
     await context.service.stop();
@@ -89,18 +139,21 @@ describe("createPersistenceService", () => {
       reason: "payload-consumer-mismatch"
     });
 
-    expect(context.workHandler.handled).toHaveLength(0);
+    expect(context.finalShadow.materializations).toHaveLength(0);
 
     await context.service.stop();
   });
 
   it("waits for in-flight persistence work during shutdown without wall-clock sleeps", async () => {
-    const context = createServiceContext();
+    const workHandler = new LocalPersistenceWorkHandler();
+    const context = createServiceContext({
+      workHandler
+    });
     const gate = deferred<undefined>();
     const started = deferred<undefined>();
 
-    context.workHandler.handleGate = gate.promise;
-    context.workHandler.onHandleStart = () => {
+    workHandler.handleGate = gate.promise;
+    workHandler.onHandleStart = () => {
       started.resolve(undefined);
     };
 
@@ -110,7 +163,7 @@ describe("createPersistenceService", () => {
     const stop = context.service.stop();
 
     expect(context.service.isDraining).toBe(true);
-    expect(context.workHandler.handled).toHaveLength(0);
+    expect(workHandler.handled).toHaveLength(0);
 
     gate.resolve(undefined);
     await expect(delivery).resolves.toMatchObject({
@@ -119,8 +172,125 @@ describe("createPersistenceService", () => {
     });
     await stop;
 
-    expect(context.workHandler.handled).toHaveLength(1);
+    expect(workHandler.handled).toHaveLength(1);
     expect(context.service.isStarted).toBe(false);
+  });
+
+  it("quarantines conflicting idempotency-key reuse with a changed payload", async () => {
+    const context = createServiceContext();
+    const delivery = createMinimalPersistenceDelivery();
+    const conflictingDelivery = {
+      ...delivery,
+      payload: createMinimalPersistencePayload({
+        commandId: "018f1598-2dd5-7c4f-9f92-8f7a7f8b5704"
+      })
+    };
+
+    await context.service.start();
+
+    await expect(context.broker.deliverPersistence(delivery)).resolves.toMatchObject({
+      action: "ack",
+      reason: "handled"
+    });
+    await expect(context.broker.deliverPersistence(conflictingDelivery)).resolves.toMatchObject({
+      action: "dlq",
+      reason: "idempotency-payload-conflict"
+    });
+
+    expect(context.finalShadow.materializations).toHaveLength(1);
+    expect(context.finalShadow.quarantines).toHaveLength(1);
+    expect(context.finalShadow.quarantines[0]).toMatchObject({
+      reason: "idempotency-payload-conflict",
+      idempotencyKey: "persistence:final-shadow:article-001:v1"
+    });
+    expect(context.backendApi.shadowAggregateCommands).toHaveLength(1);
+    expect(context.broker.published).toHaveLength(1);
+
+    await context.service.stop();
+  });
+
+  it("rolls back local final-shadow writes after backend API failure and remains recoverable", async () => {
+    const context = createServiceContext();
+    const delivery = createMinimalPersistenceDelivery();
+
+    context.backendApi.failNextShadowAggregate = true;
+    await context.service.start();
+
+    await expect(context.broker.deliverPersistence(delivery)).resolves.toMatchObject({
+      action: "retry",
+      reason: "handler-error"
+    });
+
+    expect(context.finalShadow.materializations).toHaveLength(0);
+    expect(context.finalShadow.transactionalOutboxCommands).toHaveLength(0);
+    expect(context.broker.published).toHaveLength(0);
+
+    await expect(context.broker.deliverPersistence(delivery)).resolves.toMatchObject({
+      action: "ack",
+      reason: "handled"
+    });
+
+    expect(context.finalShadow.materializations).toHaveLength(1);
+    expect(context.backendApi.shadowAggregateCommands).toHaveLength(1);
+    expect(context.broker.published).toHaveLength(1);
+
+    await context.service.stop();
+  });
+
+  it("rolls back local final-shadow transaction failures and recovers through backend idempotency", async () => {
+    const context = createServiceContext();
+    const delivery = createMinimalPersistenceDelivery();
+
+    context.finalShadow.failNextRecord = true;
+    await context.service.start();
+
+    await expect(context.broker.deliverPersistence(delivery)).resolves.toMatchObject({
+      action: "retry",
+      reason: "handler-error"
+    });
+
+    expect(context.finalShadow.materializations).toHaveLength(0);
+    expect(context.finalShadow.transactionalOutboxCommands).toHaveLength(0);
+    expect(context.backendApi.shadowAggregateCommands).toHaveLength(1);
+    expect(context.broker.published).toHaveLength(0);
+
+    await expect(context.broker.deliverPersistence(delivery)).resolves.toMatchObject({
+      action: "ack",
+      reason: "handled"
+    });
+
+    expect(context.finalShadow.materializations).toHaveLength(1);
+    expect(context.backendApi.shadowAggregateCommands).toHaveLength(1);
+    expect(context.broker.published).toHaveLength(1);
+    expect(context.outbox.records).toHaveLength(1);
+
+    await context.service.stop();
+  });
+
+  it("quarantines stale stage result versions before backend API or outbox side effects", async () => {
+    const context = createServiceContext();
+
+    context.stageViews.materializationInputs = {
+      ...context.stageViews.materializationInputs,
+      canonical: {
+        ...context.stageViews.materializationInputs.canonical,
+        resultVersion: 2
+      }
+    };
+
+    await context.service.start();
+
+    await expect(context.broker.deliverPersistence()).resolves.toMatchObject({
+      action: "dlq",
+      reason: "stale-stage-version"
+    });
+
+    expect(context.finalShadow.materializations).toHaveLength(0);
+    expect(context.finalShadow.quarantines).toHaveLength(1);
+    expect(context.backendApi.shadowAggregateCommands).toHaveLength(0);
+    expect(context.broker.published).toHaveLength(0);
+
+    await context.service.stop();
   });
 
   it("keeps liveness independent from backend API readiness but blocks readiness on compatibility", async () => {
@@ -148,12 +318,18 @@ describe("createPersistenceService", () => {
   });
 });
 
-function createServiceContext() {
+function createServiceContext(options: {
+  readonly workHandler?: LocalPersistenceWorkHandler;
+} = {}) {
   const config = loadPersistenceConfig({
     NUTSNEWS_PERSISTENCE_HTTP_PORT: "0",
     NUTSNEWS_PERSISTENCE_TELEMETRY_LOGS: "silent"
   });
-  const dependencies = createLocalPersistenceDependencies();
+  const dependencies = createLocalPersistenceDependencies({
+    ...(options.workHandler === undefined ? {} : {
+      workHandler: options.workHandler
+    })
+  });
   const telemetry = createBufferedRuntimeTelemetrySink();
   const metrics = createPrometheusRuntimeTelemetrySink({
     identity: {
@@ -180,7 +356,7 @@ function createServiceContext() {
     service,
     stageViews: dependencies.stageViewReader as LocalStageViewReader,
     telemetry,
-    workHandler: dependencies.workHandler as LocalPersistenceWorkHandler
+    workHandler: dependencies.workHandler
   };
 }
 
