@@ -4,8 +4,8 @@
 | --- | --- |
 | Repository | `ramideltoro/nutsnews-worker-article-persistence` |
 | Owner | `@ramideltoro` |
-| Responsibility | Consume persistence jobs and idempotently upsert translated article, approval, translation, and processing metadata into shadow-safe storage by default. |
-| Deployable / package type | Deployable service repo. Publishes immutable SHA-tagged images to `ghcr.io/ramideltoro/nutsnews-worker-article-persistence` after implementation work adds a Dockerfile. |
+| Responsibility | Consume persistence jobs, verify final-shadow/backend API compatibility, and own the final worker-uplift article aggregate boundary. |
+| Deployable / package type | Deployable service repo. Publishes immutable SHA-tagged images to `ghcr.io/ramideltoro/nutsnews-worker-article-persistence`. |
 | Primary artifact | Signed GHCR image tagged only by commit SHA |
 | Support boundary | Repo-local code, tests, CI, package/image publishing, and service-local run notes. |
 | Outside boundary | Backend host runtime/deployments, Grafana Cloud resources, explanatory architecture/operations docs, production secrets, legacy ingestion. |
@@ -26,7 +26,7 @@
 - Default Actions token permission: read-only.
 - Publish workflows request package write permission only inside publish jobs.
 - CI validates repo boundary docs on every push and pull request.
-- CodeQL and dependency review workflows are present for future code-bearing changes.
+- CodeQL and dependency review workflows validate code-bearing changes.
 - Dependabot checks GitHub Actions and npm manifests.
 - Branch protection requires pull requests, resolved conversations, and the `validate` status check where GitHub permits repository branch protection. CODEOWNERS documents ownership for reviews.
 
