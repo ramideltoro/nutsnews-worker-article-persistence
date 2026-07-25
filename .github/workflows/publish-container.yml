@@ -58,6 +58,8 @@ jobs:
           labels: |
             org.opencontainers.image.source=https://github.com/ramideltoro/nutsnews-worker-article-persistence
             org.opencontainers.image.revision=${{ github.sha }}
+          secrets: |
+            npm_token=${{ secrets.GITHUB_TOKEN }}
 
       - name: Install cosign
         if: steps.dockerfile.outputs.has_dockerfile == 'true'
