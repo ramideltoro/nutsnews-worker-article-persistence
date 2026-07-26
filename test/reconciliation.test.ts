@@ -141,13 +141,16 @@ describe("persistence outbox reconciliation", () => {
   it("fails closed without publishing when the authoritative envelope is missing", async () => {
     const command = publicationCommand();
     const pool = new FakePool([
-      {
-        ...outboxRow(command),
-        diagnostic_metadata: {
-          payload: command.payload,
-          payloadSchemaId: command.payload.schemaId
+      [
+        {
+          ...outboxRow(command),
+          diagnostic_metadata: {
+            payload: command.payload,
+            payloadSchemaId: command.payload.schemaId
+          }
         }
-      }
+      ],
+      []
     ]);
     const transport = new FakeBrokerTransport();
     const reconciler = new PostgresPersistenceOutboxReconciler({
@@ -166,7 +169,103 @@ describe("persistence outbox reconciliation", () => {
     });
 
     expect(report.status).toBe("failed_closed");
-    expect(report.errors).toContain("1:missing-stored-envelope");
+    expect(report.errors).toContain("1:legacy-publication-metadata-missing");
+    expect(report.writesPerformed).toBe(false);
+    expect(transport.published).toHaveLength(0);
+  });
+
+  it("recovers legacy publication-readiness rows from service-owned final-shadow metadata", async () => {
+    const command = publicationCommand();
+    const pool = new FakePool([
+      [
+        {
+          ...outboxRow(command),
+          diagnostic_metadata: {
+            exchange: getWorkerRoute("publication").exchange,
+            payload: command.payload,
+            payloadSchemaId: command.payload.schemaId
+          }
+        }
+      ],
+      [
+        legacyPublicationMetadataRow(command)
+      ]
+    ]);
+    const transport = new FakeBrokerTransport();
+    const reconciler = new PostgresPersistenceOutboxReconciler({
+      pool: pool.asPool(),
+      brokerTransport: transport,
+      clock,
+      env: {
+        NUTSNEWS_PERSISTENCE_RECONCILIATION_APPLY_ENABLED: "true"
+      }
+    });
+
+    const report = await reconciler.reconcile({
+      mode: "apply",
+      runId: "recovery-20260723",
+      protectedConfirmation: PERSISTENCE_RECONCILIATION_CONFIRMATION
+    });
+
+    expect(report).toMatchObject({
+      status: "applied",
+      selectedCount: 1,
+      replayedCount: 1,
+      failedClosedCount: 0,
+      writesPerformed: true,
+      productionVisibilityEnabled: false
+    });
+    expect(report.candidates[0]).toMatchObject({
+      selectedReason: "legacy-publication-readiness-recovered",
+      idempotencyKey: command.envelope.idempotencyKey
+    });
+    expect(typeof report.candidates[0]?.replayMessageId).toBe("string");
+    expect(transport.published).toHaveLength(1);
+    const replay = transport.published[0];
+    expect(replay?.envelope.messageId).not.toBe(command.envelope.messageId);
+    expect(replay?.envelope.idempotencyKey).toBe(command.envelope.idempotencyKey);
+    expect(replay?.envelope.correlationId).toBe(command.envelope.correlationId);
+    expect(replay?.envelope.causationId).toBe(command.envelope.causationId);
+    expect(replay?.envelope.aggregate).toEqual(command.envelope.aggregate);
+    expect(replay?.payload).toEqual(command.payload);
+  });
+
+  it("fails closed when legacy final-shadow metadata does not match the stored payload ref", async () => {
+    const command = publicationCommand();
+    const pool = new FakePool([
+      [
+        {
+          ...outboxRow(command),
+          diagnostic_metadata: {
+            payload: command.payload,
+            payloadSchemaId: command.payload.schemaId
+          }
+        }
+      ],
+      [
+        legacyPublicationMetadataRow(command, {
+          aggregate_payload_digest: "sha256:mismatch"
+        })
+      ]
+    ]);
+    const transport = new FakeBrokerTransport();
+    const reconciler = new PostgresPersistenceOutboxReconciler({
+      pool: pool.asPool(),
+      brokerTransport: transport,
+      clock,
+      env: {
+        NUTSNEWS_PERSISTENCE_RECONCILIATION_APPLY_ENABLED: "true"
+      }
+    });
+
+    const report = await reconciler.reconcile({
+      mode: "apply",
+      runId: "recovery-20260723",
+      protectedConfirmation: PERSISTENCE_RECONCILIATION_CONFIRMATION
+    });
+
+    expect(report.status).toBe("failed_closed");
+    expect(report.errors).toContain("1:legacy-final-payload-digest-mismatch");
     expect(report.writesPerformed).toBe(false);
     expect(transport.published).toHaveLength(0);
   });
@@ -192,7 +291,53 @@ function publicationCommand(): BrokerPublishCommand {
       "fr"
     ],
     missingLanguageCodes: [],
-    snapshotRefreshRequired: true
+    snapshotRefreshRequired: true,
+    publicationRef: {
+      kind: "backend-record",
+      uri: "backend://worker-uplift/final-shadow/article-001/v1",
+      mediaType: "application/json",
+      policyVersion: "2026-07-23.worker-uplift-api-admin-compatibility-contract.v1",
+      articleVersion: 1,
+      currentArticleVersion: 1,
+      aggregateVersion: 1,
+      finalAggregateVersion: 1,
+      payloadDigest: "sha256:final-aggregate",
+      canonicalIdentityHash: "article-001",
+      canonicalIdentityValid: true,
+      enrichmentPolicyValid: true,
+      approvalStatus: "accepted",
+      sourceSummaryPersisted: true,
+      processingState: "clear",
+      originalUrl: "shadow://article/article-001",
+      operationVersion: "public-feed-snapshot-compat-v1",
+      publicFeedSnapshotRequest: {
+        limit: 6,
+        offset: 0,
+        category: "all",
+        languageCode: "en"
+      },
+      publicFeedSnapshot: {
+        id: "article-001",
+        source: "worker-uplift-shadow",
+        title: "Sanitized public-feed compatibility title",
+        originalUrl: "shadow://article/article-001",
+        imageUrl: "https://example.invalid/public-feed/article.jpg",
+        publishedAt: now,
+        publishedOnSiteAt: now,
+        aiSummary: "Sanitized public-feed compatibility summary.",
+        category: "world",
+        positivityScore: 0,
+        status: "published",
+        snapshotRank: 1
+      },
+      localizedSummaries: [
+        {
+          languageCode: "fr",
+          title: "Sanitized localized public-feed title",
+          summary: "Sanitized localized public-feed summary."
+        }
+      ]
+    }
   };
   const envelope = assertWorkerEnvelope({
     schemaId: route.schemaId,
@@ -221,7 +366,7 @@ function publicationCommand(): BrokerPublishCommand {
     },
     payloadRef: {
       kind: "backend-record",
-      uri: "backend://worker-uplift/persistence/article-001/publication-readiness",
+      uri: "backend://worker-uplift/final-shadow/article-001/v1/publication-readiness",
       mediaType: "application/json",
       sizeBytes: getStagePayloadSizeBytes(payload),
       digest: sha256Digest(payload)
@@ -258,6 +403,47 @@ function outboxRow(command: BrokerPublishCommand): QueryResultRow {
       payload: command.payload,
       payloadSchemaId: command.payload.schemaId
     }
+  };
+}
+
+function legacyPublicationMetadataRow(
+  command: BrokerPublishCommand,
+  overrides: QueryResultRow = {}
+): QueryResultRow {
+  const payload = command.payload;
+  const publicationRef = payload.publicationRef as Readonly<Record<string, unknown>>;
+
+  return {
+    request_ref: publicationRef.uri,
+    response_ref: command.envelope.payloadRef.uri,
+    request_status: "accepted",
+    write_diagnostic_metadata: {
+      audit: {
+        status: "recorded_success",
+        articleId: command.envelope.aggregate.id,
+        commandId: "translation-result:article-001:v1",
+        messageId: command.envelope.causationId,
+        traceparent: command.envelope.traceparent,
+        correlationId: command.envelope.correlationId,
+        payloadDigest: publicationRef.payloadDigest,
+        pipelineRunId: payload.pipelineRunId,
+        articleVersion: command.envelope.aggregate.version,
+        idempotencyKey: "translation:result:article-001:1",
+        sourceMessageId: "018f1598-2dd5-7c4f-9f92-8f7a7f8b3301",
+        aggregateVersion: command.envelope.aggregate.version
+      },
+      commandId: "translation-result:article-001:v1",
+      duplicate: true,
+      payloadDigest: publicationRef.payloadDigest,
+      idempotencyKey: "translation:result:article-001:1",
+      safeMetadataOnly: true,
+      publicationReadinessIdempotencyKey: command.envelope.idempotencyKey
+    },
+    aggregate_payload_ref: publicationRef.uri,
+    aggregate_payload_digest: publicationRef.payloadDigest,
+    publication_status: "ready",
+    aggregate_version: command.envelope.aggregate.version,
+    ...overrides
   };
 }
 
@@ -300,8 +486,15 @@ function firstQuery(pool: FakePool): { readonly sql: string; readonly values: re
 
 class FakePool {
   readonly queries: { readonly sql: string; readonly values: readonly unknown[] }[] = [];
+  private readonly selectBatches: QueryResultRow[][];
+  private selectIndex = 0;
 
-  constructor(private readonly rows: readonly QueryResultRow[]) {}
+  constructor(rows: readonly QueryResultRow[] | readonly (readonly QueryResultRow[])[]) {
+    const first = rows[0] as unknown;
+    this.selectBatches = Array.isArray(first)
+      ? (rows as readonly (readonly QueryResultRow[])[]).map((batch) => [...batch])
+      : [[...(rows as readonly QueryResultRow[])]];
+  }
 
   asPool() {
     return this as never;
@@ -314,9 +507,12 @@ class FakePool {
     });
 
     if (sql.trimStart().startsWith("SELECT")) {
+      const batch = this.selectBatches[Math.min(this.selectIndex, this.selectBatches.length - 1)] ?? [];
+      this.selectIndex += 1;
+
       return Promise.resolve({
-        rows: [...this.rows],
-        rowCount: this.rows.length
+        rows: [...batch],
+        rowCount: batch.length
       });
     }
 
