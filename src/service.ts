@@ -96,6 +96,9 @@ export function createPersistenceService(options: PersistenceServiceOptions): Pe
             attributes: {
               event: "persistence.message.delegated",
               dependency: options.dependencies.workHandler.name,
+              ...(result.status === "ok" ? {} : {
+                reason: result.reason
+              }),
               shadowMode: options.config.shadowMode,
               productionWritesEnabled: options.config.security.productionWritesEnabled
             }
@@ -170,7 +173,9 @@ export function createPersistenceService(options: PersistenceServiceOptions): Pe
         queue: persistenceRoute.mainQueue.name,
         outcome: "success",
         attributes: {
-          dependency: "persistence-shell",
+          dependency: options.config.dependencyMode === "production"
+            ? "persistence-production-adapters"
+            : "persistence-shell",
           mode: options.config.dependencyMode,
           prefetch: options.config.prefetch,
           concurrency: options.config.concurrency,
