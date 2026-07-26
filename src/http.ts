@@ -1,4 +1,5 @@
 import http from "node:http";
+import { timingSafeEqual } from "node:crypto";
 import type { AddressInfo } from "node:net";
 
 import {
@@ -10,12 +11,19 @@ import {
   PERSISTENCE_CONFIG_SCHEMA,
   type PersistenceConfig
 } from "./config.js";
+import {
+  PERSISTENCE_RECONCILIATION_PATH,
+  type PersistenceReconciliationRequest,
+  type PersistenceReconciler
+} from "./reconciliation.js";
 import type { PersistenceService } from "./service.js";
 
 export interface PersistenceHttpServerOptions {
   readonly config: PersistenceConfig;
   readonly service: PersistenceService;
   readonly metrics?: PrometheusRuntimeTelemetrySink;
+  readonly reconciler?: PersistenceReconciler;
+  readonly reconciliationToken?: string;
 }
 
 export interface PersistenceHttpServer {
@@ -68,6 +76,11 @@ async function routeRequest(
 ): Promise<void> {
   const url = new URL(request.url ?? "/", "http://localhost");
 
+  if (request.method === "POST" && url.pathname === PERSISTENCE_RECONCILIATION_PATH) {
+    await handleReconciliationRequest(options, request, response);
+    return;
+  }
+
   if (request.method !== "GET") {
     writeJson(response, 405, {
       status: "method-not-allowed"
@@ -103,6 +116,116 @@ async function routeRequest(
         status: "not-found"
       });
   }
+}
+
+async function handleReconciliationRequest(
+  options: PersistenceHttpServerOptions,
+  request: http.IncomingMessage,
+  response: http.ServerResponse
+): Promise<void> {
+  if (options.reconciler === undefined || options.reconciliationToken === undefined) {
+    writeJson(response, 503, {
+      service: "persistence",
+      status: "not_configured",
+      writesPerformed: false,
+      dryRun: true,
+      productionVisibilityEnabled: false,
+      legacyRuntimeRequired: false,
+      errors: [
+        "persistence reconciliation endpoint is not configured"
+      ]
+    });
+    return;
+  }
+
+  if (!authorized(request.headers.authorization, options.reconciliationToken)) {
+    writeJson(response, 401, {
+      service: "persistence",
+      status: "unauthorized",
+      writesPerformed: false,
+      dryRun: true,
+      productionVisibilityEnabled: false,
+      legacyRuntimeRequired: false,
+      errors: [
+        "valid bearer token required"
+      ]
+    });
+    return;
+  }
+
+  let body: PersistenceReconciliationRequest;
+
+  try {
+    body = await readJsonBody(request);
+  } catch (error: unknown) {
+    writeJson(response, 400, {
+      service: "persistence",
+      status: "failed_closed",
+      writesPerformed: false,
+      dryRun: true,
+      productionVisibilityEnabled: false,
+      legacyRuntimeRequired: false,
+      errors: [
+        error instanceof Error ? error.message : "invalid reconciliation request body"
+      ]
+    });
+    return;
+  }
+
+  const report = await options.reconciler.reconcile(body);
+  const statusCode = report.status === "applied" || report.status === "dry_run"
+    ? 200
+    : report.status === "kill_switch_active"
+      ? 423
+      : 409;
+
+  writeJson(response, statusCode, report);
+}
+
+function authorized(header: string | undefined, expectedToken: string): boolean {
+  if (!header?.startsWith("Bearer ")) {
+    return false;
+  }
+
+  const provided = Buffer.from(header.slice("Bearer ".length));
+  const expected = Buffer.from(expectedToken);
+
+  return provided.length === expected.length && timingSafeEqual(provided, expected);
+}
+
+function readJsonBody(request: http.IncomingMessage): Promise<PersistenceReconciliationRequest> {
+  const chunks: Buffer[] = [];
+  let totalBytes = 0;
+  const maxBytes = 16_384;
+
+  return new Promise((resolve, reject) => {
+    request.on("data", (chunk: Buffer) => {
+      totalBytes += chunk.byteLength;
+
+      if (totalBytes > maxBytes) {
+        reject(new Error("reconciliation request body is too large"));
+        request.destroy();
+        return;
+      }
+
+      chunks.push(chunk);
+    });
+    request.on("error", reject);
+    request.on("end", () => {
+      try {
+        const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8")) as unknown;
+
+        if (!isRecord(parsed)) {
+          reject(new Error("reconciliation request body must be a JSON object"));
+          return;
+        }
+
+        resolve(parsed as unknown as PersistenceReconciliationRequest);
+      } catch {
+        reject(new Error("reconciliation request body must be valid JSON"));
+      }
+    });
+  });
 }
 
 function writeHealth(
@@ -142,4 +265,8 @@ function writeText(
 
 function isAddressInfo(address: string | AddressInfo | null): address is AddressInfo {
   return typeof address === "object" && address !== null;
+}
+
+function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

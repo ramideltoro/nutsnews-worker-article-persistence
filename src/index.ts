@@ -16,6 +16,7 @@ import {
 } from "./config.js";
 import { createPersistenceHttpServer } from "./http.js";
 import { createProductionPersistenceDependencies } from "./production.js";
+import type { PersistenceReconciler } from "./reconciliation.js";
 import { createPersistenceService } from "./service.js";
 import { createLocalPersistenceDependencies } from "./test-doubles.js";
 
@@ -95,11 +96,20 @@ export {
   type PersistenceHttpServer
 } from "./http.js";
 export {
+  PERSISTENCE_RECONCILIATION_CONFIRMATION,
+  PERSISTENCE_RECONCILIATION_PATH,
+  type PersistenceReconciliationCandidate,
+  type PersistenceReconciliationReport,
+  type PersistenceReconciliationRequest,
+  type PersistenceReconciler
+} from "./reconciliation.js";
+export {
   HttpPersistenceBackendWorkerApiClient,
   PostgresPersistenceBrokerOutbox,
   PostgresPersistenceFeedHealthProjectionStore,
   PostgresPersistenceFinalShadowTransactionRunner,
   PostgresPersistenceInboxStore,
+  PostgresPersistenceOutboxReconciler,
   PostgresPersistenceStageViewReader,
   createProductionPersistenceDependencies,
   type ProductionPersistenceDependencies
@@ -179,6 +189,12 @@ export function createPersistenceApplication(config = loadPersistenceConfig()): 
   const httpServer = createPersistenceHttpServer({
     config,
     service,
+    ...(hasReconciler(dependencies) ? {
+      reconciler: dependencies.reconciler
+    } : {}),
+    ...(hasReconciliationToken(dependencies) ? {
+      reconciliationToken: dependencies.reconciliationToken
+    } : {}),
     ...(metrics === undefined ? {} : {
       metrics
     })
@@ -226,6 +242,22 @@ function hasClose(value: unknown): value is { close(): Promise<void> } {
     && value !== null
     && "close" in value
     && typeof value.close === "function";
+}
+
+function hasReconciler(value: unknown): value is { readonly reconciler: PersistenceReconciler } {
+  return typeof value === "object"
+    && value !== null
+    && "reconciler" in value
+    && typeof value.reconciler === "object"
+    && value.reconciler !== null;
+}
+
+function hasReconciliationToken(value: unknown): value is { readonly reconciliationToken: string } {
+  return typeof value === "object"
+    && value !== null
+    && "reconciliationToken" in value
+    && typeof value.reconciliationToken === "string"
+    && value.reconciliationToken.length > 0;
 }
 
 function combineTelemetrySinks(
