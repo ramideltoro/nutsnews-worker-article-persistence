@@ -2,6 +2,10 @@ import { createHash, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 
 import {
+  STAGE_PAYLOAD_SCHEMA_IDS,
+  WORKER_DELIVERY_BEHAVIOR,
+  getStagePayloadSizeBytes,
+  getWorkerRoute,
   validateStagePayload,
   validateWorkerEnvelope
 } from "@ramideltoro/nutsnews-worker-contracts";
@@ -840,10 +844,26 @@ interface PersistenceOutboxRow extends QueryResultRow {
   readonly diagnostic_metadata: unknown;
 }
 
+interface LegacyPublicationReadinessMetadataRow extends QueryResultRow {
+  readonly request_ref: string;
+  readonly response_ref: string | null;
+  readonly request_status: string;
+  readonly write_diagnostic_metadata: unknown;
+  readonly aggregate_payload_ref: string;
+  readonly aggregate_payload_digest: string;
+  readonly publication_status: string;
+  readonly aggregate_version: number | string;
+}
+
 interface HydratedReplay {
   readonly row: PersistenceOutboxRow;
   readonly candidate: PersistenceReconciliationCandidate;
   readonly command: BrokerPublishCommand;
+}
+
+interface RecoveredEnvelope {
+  readonly selectedReason: string;
+  readonly envelope: Readonly<Record<string, unknown>>;
 }
 
 export class PostgresPersistenceOutboxReconciler implements PersistenceReconciler {
@@ -896,7 +916,7 @@ export class PostgresPersistenceOutboxReconciler implements PersistenceReconcile
     }
 
     const rows = await this.selectCandidates(maxItems, minAgeSeconds, runId);
-    const hydrated = rows.map((row) => this.hydrate(row, requestedAt));
+    const hydrated = await Promise.all(rows.map((row) => this.hydrate(row, requestedAt)));
     const failed = hydrated.filter((candidate): candidate is PersistenceReconciliationCandidate => "status" in candidate);
 
     if (failed.length > 0) {
@@ -992,22 +1012,14 @@ export class PostgresPersistenceOutboxReconciler implements PersistenceReconcile
     return result.rows;
   }
 
-  private hydrate(row: PersistenceOutboxRow, requestedAt: string): HydratedReplay | PersistenceReconciliationCandidate {
+  private async hydrate(row: PersistenceOutboxRow, requestedAt: string): Promise<HydratedReplay | PersistenceReconciliationCandidate> {
     const baseCandidate = candidateFromRow(row, "confirmed-outbox-replay");
     const diagnostic = recordValue(row.diagnostic_metadata);
     const payload = diagnostic.payload;
-    const envelope = diagnostic.envelope;
+    const storedEnvelope = diagnostic.envelope;
 
     if (!isRecord(payload)) {
       return failedCandidate(baseCandidate, "missing-stored-payload");
-    }
-
-    if (!isRecord(envelope)) {
-      return failedCandidate(baseCandidate, "missing-stored-envelope");
-    }
-
-    if (row.payload_ref !== stringFrom(recordValue(envelope.payloadRef).uri, "")) {
-      return failedCandidate(baseCandidate, "payload-ref-mismatch");
     }
 
     if (row.payload_digest !== sha256Digest(payload)) {
@@ -1018,6 +1030,23 @@ export class PostgresPersistenceOutboxReconciler implements PersistenceReconcile
 
     if (!payloadValidation.ok) {
       return failedCandidate(baseCandidate, `invalid-stored-payload:${payloadValidation.issues[0]?.code ?? "unknown"}`);
+    }
+
+    const recovered = isRecord(storedEnvelope)
+      ? {
+          selectedReason: "confirmed-outbox-replay",
+          envelope: storedEnvelope
+        }
+      : await this.recoverLegacyPublicationReadinessEnvelope(row, payload, requestedAt);
+
+    if (typeof recovered === "string") {
+      return failedCandidate(baseCandidate, recovered);
+    }
+
+    const envelope = recovered.envelope;
+
+    if (row.payload_ref !== stringFrom(recordValue(envelope.payloadRef).uri, "")) {
+      return failedCandidate(baseCandidate, "payload-ref-mismatch");
     }
 
     const replayMessageId = randomUUID();
@@ -1045,6 +1074,7 @@ export class PostgresPersistenceOutboxReconciler implements PersistenceReconcile
       row,
       candidate: {
         ...baseCandidate,
+        selectedReason: recovered.selectedReason,
         replayMessageId
       },
       command: {
@@ -1052,6 +1082,222 @@ export class PostgresPersistenceOutboxReconciler implements PersistenceReconcile
         payload
       }
     };
+  }
+
+  private async recoverLegacyPublicationReadinessEnvelope(
+    row: PersistenceOutboxRow,
+    payload: Readonly<Record<string, unknown>>,
+    requestedAt: string
+  ): Promise<RecoveredEnvelope | string> {
+    if (row.destination_stage !== "publication") {
+      return "missing-stored-envelope";
+    }
+
+    if (stringFrom(payload.schemaId, "") !== STAGE_PAYLOAD_SCHEMA_IDS.publicationReadiness) {
+      return "missing-stored-envelope";
+    }
+
+    const publicationRef = recordValue(payload.publicationRef);
+    const publicationRefUri = stringFrom(publicationRef.uri, "");
+    const publicationRefDigest = stringFrom(publicationRef.payloadDigest, "");
+    const articleVersion = positiveInteger(publicationRef.articleVersion)
+      ?? positiveInteger(publicationRef.currentArticleVersion)
+      ?? positiveInteger(publicationRef.aggregateVersion)
+      ?? positiveInteger(row.operation_version);
+
+    if (articleVersion === undefined) {
+      return "legacy-publication-version-missing";
+    }
+
+    if (stringFrom(payload.idempotencyKey, "") !== row.idempotency_key) {
+      return "legacy-idempotency-mismatch";
+    }
+
+    if (stringFrom(payload.pipelineRunId, "") !== row.pipeline_run_id) {
+      return "legacy-pipeline-run-mismatch";
+    }
+
+    if (stringFrom(payload.stageExecutionId, "") !== row.stage_execution_id) {
+      return "legacy-stage-execution-mismatch";
+    }
+
+    if (stringFrom(payload.articleId, "") !== row.entity_id) {
+      return "legacy-article-id-mismatch";
+    }
+
+    if (publicationRefUri.length === 0 || publicationRefDigest.length === 0) {
+      return "legacy-publication-ref-missing";
+    }
+
+    if (row.payload_ref !== `${publicationRefUri}/publication-readiness`) {
+      return "legacy-payload-ref-mismatch";
+    }
+
+    const metadata = await this.readLegacyPublicationMetadata(row);
+
+    if (metadata === undefined) {
+      return "legacy-publication-metadata-missing";
+    }
+
+    if (metadata === "ambiguous") {
+      return "legacy-publication-metadata-ambiguous";
+    }
+
+    const aggregateVersion = positiveInteger(metadata.aggregate_version);
+
+    if (aggregateVersion === undefined || aggregateVersion !== articleVersion) {
+      return "legacy-final-aggregate-version-mismatch";
+    }
+
+    if (metadata.request_status !== "accepted") {
+      return "legacy-write-request-not-accepted";
+    }
+
+    if (metadata.request_ref !== publicationRefUri || metadata.response_ref !== row.payload_ref) {
+      return "legacy-write-request-ref-mismatch";
+    }
+
+    if (metadata.aggregate_payload_ref !== publicationRefUri) {
+      return "legacy-final-payload-ref-mismatch";
+    }
+
+    if (metadata.aggregate_payload_digest !== publicationRefDigest) {
+      return "legacy-final-payload-digest-mismatch";
+    }
+
+    if (stringFrom(publicationRef.canonicalIdentityHash, row.entity_id) !== row.entity_id) {
+      return "legacy-canonical-identity-mismatch";
+    }
+
+    const finalAggregateVersion = positiveInteger(publicationRef.finalAggregateVersion)
+      ?? positiveInteger(publicationRef.aggregateVersion);
+
+    if (finalAggregateVersion !== undefined && finalAggregateVersion !== aggregateVersion) {
+      return "legacy-publication-ref-version-mismatch";
+    }
+
+    const expectedReadinessStatus = metadata.publication_status === "ready"
+      ? "ready"
+      : "blocked_missing_translations";
+
+    if (stringFrom(payload.readinessStatus, "") !== expectedReadinessStatus) {
+      return "legacy-readiness-status-mismatch";
+    }
+
+    if (payload.snapshotRefreshRequired !== (metadata.publication_status === "ready")) {
+      return "legacy-snapshot-refresh-mismatch";
+    }
+
+    const writeDiagnostic = recordValue(metadata.write_diagnostic_metadata);
+    const writeAudit = recordValue(writeDiagnostic.audit);
+    const sourceMessageId = stringFrom(payload.sourceMessageId, "");
+    const correlationId = stringFrom(writeAudit.correlationId, "");
+    const traceparent = stringFrom(payload.traceparent, "");
+
+    if (stringFrom(writeDiagnostic.publicationReadinessIdempotencyKey, "") !== row.idempotency_key) {
+      return "legacy-readiness-idempotency-mismatch";
+    }
+
+    if (stringFrom(writeDiagnostic.payloadDigest, "") !== publicationRefDigest) {
+      return "legacy-write-payload-digest-mismatch";
+    }
+
+    if (sourceMessageId.length === 0 || stringFrom(writeAudit.messageId, "") !== sourceMessageId) {
+      return "legacy-causation-id-mismatch";
+    }
+
+    if (correlationId.length === 0) {
+      return "legacy-correlation-id-missing";
+    }
+
+    if (traceparent.length > 0 && stringFrom(writeAudit.traceparent, traceparent) !== traceparent) {
+      return "legacy-traceparent-mismatch";
+    }
+
+    if (stringFrom(writeAudit.articleId, row.entity_id) !== row.entity_id) {
+      return "legacy-audit-article-id-mismatch";
+    }
+
+    const auditArticleVersion = positiveInteger(writeAudit.articleVersion);
+
+    if (auditArticleVersion !== undefined && auditArticleVersion !== articleVersion) {
+      return "legacy-audit-article-version-mismatch";
+    }
+
+    const route = getWorkerRoute("publication");
+    const envelope = {
+      schemaId: route.schemaId,
+      schemaVersion: row.schema_version,
+      route: "publication",
+      messageId: row.outbox_message_id,
+      causationId: sourceMessageId,
+      correlationId,
+      ...(traceparent.length === 0 ? {} : {
+        traceparent
+      }),
+      idempotencyKey: row.idempotency_key,
+      aggregate: {
+        type: row.entity_kind,
+        id: row.entity_id,
+        version: articleVersion
+      },
+      occurredAt: stringFrom(payload.producedAt, requestedAt),
+      attempt: {
+        count: 1,
+        max: WORKER_DELIVERY_BEHAVIOR.maxAttempts,
+        firstAttemptAt: stringFrom(payload.producedAt, requestedAt)
+      },
+      producer: {
+        name: "persistence",
+        version: "0.1.0"
+      },
+      payloadRef: {
+        kind: "backend-record",
+        uri: row.payload_ref,
+        mediaType: "application/json",
+        sizeBytes: getStagePayloadSizeBytes(payload),
+        digest: row.payload_digest
+      }
+    };
+
+    return {
+      selectedReason: "legacy-publication-readiness-recovered",
+      envelope
+    };
+  }
+
+  private async readLegacyPublicationMetadata(row: PersistenceOutboxRow): Promise<LegacyPublicationReadinessMetadataRow | "ambiguous" | undefined> {
+    const result = await this.options.pool.query<LegacyPublicationReadinessMetadataRow>(
+      `SELECT wr.request_ref, wr.response_ref, wr.status AS request_status,
+              wr.diagnostic_metadata AS write_diagnostic_metadata,
+              final.payload_ref AS aggregate_payload_ref,
+              final.payload_digest AS aggregate_payload_digest,
+              final.publication_status, final.aggregate_version
+       FROM ${PERSISTENCE_SCHEMA}.write_requests wr
+       INNER JOIN ${FINAL_SCHEMA}.article_shadow_aggregates final
+          ON final.article_identity_hash = wr.article_identity_hash
+         AND final.aggregate_version = wr.operation_version
+       WHERE wr.article_identity_hash = $1
+         AND wr.request_kind = 'article'
+         AND wr.operation_version = $2
+         AND wr.status = 'accepted'
+         AND wr.response_ref = $3
+         AND wr.diagnostic_metadata->>'publicationReadinessIdempotencyKey' = $4
+       ORDER BY wr.id ASC
+       LIMIT 2`,
+      [
+        row.entity_id,
+        row.operation_version,
+        row.payload_ref,
+        row.idempotency_key
+      ]
+    );
+
+    if (result.rows.length > 1) {
+      return "ambiguous";
+    }
+
+    return result.rows[0];
   }
 
   private async recordReplay(
@@ -1514,6 +1760,18 @@ function translationQualityStatus(value: string | undefined): PersistenceFinalMa
 
 function stringFrom(value: unknown, fallback: string): string {
   return typeof value === "string" && value.length > 0 ? value : fallback;
+}
+
+function positiveInteger(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isInteger(value) && value > 0) {
+    return value;
+  }
+
+  if (typeof value === "string" && /^[1-9][0-9]*$/u.test(value)) {
+    return Number(value);
+  }
+
+  return undefined;
 }
 
 function booleanValue(value: unknown): boolean {
