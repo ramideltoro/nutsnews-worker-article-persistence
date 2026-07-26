@@ -15,6 +15,7 @@ import {
   type PersistenceConfig
 } from "./config.js";
 import { createPersistenceHttpServer } from "./http.js";
+import { createProductionPersistenceDependencies } from "./production.js";
 import { createPersistenceService } from "./service.js";
 import { createLocalPersistenceDependencies } from "./test-doubles.js";
 
@@ -94,6 +95,19 @@ export {
   type PersistenceHttpServer
 } from "./http.js";
 export {
+  HttpPersistenceBackendWorkerApiClient,
+  PostgresPersistenceBrokerOutbox,
+  PostgresPersistenceFeedHealthProjectionStore,
+  PostgresPersistenceFinalShadowTransactionRunner,
+  PostgresPersistenceInboxStore,
+  PostgresPersistenceStageViewReader,
+  createProductionPersistenceDependencies,
+  type ProductionPersistenceDependencies
+} from "./production.js";
+export {
+  PayloadRabbitMqTransport
+} from "./rabbitmq-payload-transport.js";
+export {
   createPersistenceService,
   type PersistenceService
 } from "./service.js";
@@ -144,9 +158,14 @@ export function createPersistenceApplication(config = loadPersistenceConfig()): 
       })
     : undefined;
   const telemetry = combineTelemetrySinks(logSink, metrics);
-  const dependencies = createLocalPersistenceDependencies({
-    clock: SYSTEM_RUNTIME_CLOCK
-  });
+  const dependencies = config.dependencyMode === "production"
+    ? createProductionPersistenceDependencies({
+        config,
+        clock: SYSTEM_RUNTIME_CLOCK
+      })
+    : createLocalPersistenceDependencies({
+        clock: SYSTEM_RUNTIME_CLOCK
+      });
   const service = createPersistenceService({
     config,
     dependencies,
@@ -171,6 +190,11 @@ export function createPersistenceApplication(config = loadPersistenceConfig()): 
       },
       async () => {
         await service.stop();
+      },
+      async () => {
+        if (hasClose(dependencies)) {
+          await dependencies.close();
+        }
       }
     ],
     signalSource: process,
@@ -195,6 +219,13 @@ export function createPersistenceApplication(config = loadPersistenceConfig()): 
       await shutdown.trigger("manual");
     }
   };
+}
+
+function hasClose(value: unknown): value is { close(): Promise<void> } {
+  return typeof value === "object"
+    && value !== null
+    && "close" in value
+    && typeof value.close === "function";
 }
 
 function combineTelemetrySinks(
