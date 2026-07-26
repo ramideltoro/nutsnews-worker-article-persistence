@@ -16,7 +16,10 @@ import type {
   FeedHealthProjectionCounts,
   FeedHealthProjectionEvent
 } from "./feed-health-types.js";
-import { createFinalShadowMaterializationHandler } from "./materialization.js";
+import {
+  createFinalShadowMaterializationHandler,
+  isTranslationSummaryPersistenceCommandPayload
+} from "./materialization.js";
 
 type JsonRecord = Readonly<Record<string, unknown>>;
 
@@ -76,9 +79,17 @@ export class PersistenceRoutingWorkHandler implements PersistenceWorkHandler {
   ) {}
 
   handle(context: RuntimeMessageContext, tools: PersistenceWorkTools): RuntimeHandlerResult | Promise<RuntimeHandlerResult> {
-    return isFeedHealthProjectionPayload(context.payload)
-      ? this.feedHealthProjectionHandler.handle(context, tools)
-      : this.finalMaterializationHandler.handle(context, tools);
+    if (isFeedHealthProjectionPayload(context.payload)) {
+      return this.feedHealthProjectionHandler.handle(context, tools);
+    }
+
+    if (isTranslationSummaryPersistenceCommandPayload(context.payload)) {
+      return {
+        status: "ok"
+      };
+    }
+
+    return this.finalMaterializationHandler.handle(context, tools);
   }
 }
 

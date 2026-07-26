@@ -24,6 +24,7 @@ import {
   LocalStageViewReader,
   createLocalPersistenceDependencies,
   createMinimalPersistenceDelivery,
+  createMinimalPersistenceEnvelope,
   createMinimalPersistencePayload
 } from "../src/test-doubles.js";
 
@@ -140,6 +141,63 @@ describe("createPersistenceService", () => {
     });
 
     expect(context.finalShadow.materializations).toHaveLength(0);
+
+    await context.service.stop();
+  });
+
+  it("acknowledges translation summary persistence commands without final side effects", async () => {
+    const context = createServiceContext();
+    const delivery = createTranslationSummaryPersistenceDelivery("fr");
+
+    await context.service.start();
+
+    await expect(context.broker.deliverPersistence(delivery)).resolves.toMatchObject({
+      action: "ack",
+      reason: "handled"
+    });
+
+    expect(context.finalShadow.materializations).toHaveLength(0);
+    expect(context.backendApi.shadowAggregateCommands).toHaveLength(0);
+    expect(context.broker.published).toHaveLength(0);
+
+    await context.service.stop();
+  });
+
+  it("materializes aggregate translation status messages into final shadow state", async () => {
+    const context = createServiceContext();
+    const delivery = createTranslationStatusPersistenceDelivery();
+
+    await context.service.start();
+
+    await expect(context.broker.deliverPersistence(delivery)).resolves.toMatchObject({
+      action: "ack",
+      reason: "handled"
+    });
+
+    expect(context.finalShadow.materializations).toHaveLength(1);
+    expect(context.backendApi.shadowAggregateCommands).toHaveLength(1);
+    expect(context.broker.published).toHaveLength(1);
+    expect(context.finalShadow.materializations[0]?.request).toMatchObject({
+      commandId: "translation-result:article-001:v1",
+      payloadBackendOperation: "save-accepted-articles-batch",
+      stageRefs: {
+        translations: [
+          {
+            languageCode: "fr",
+            version: 1
+          },
+          {
+            languageCode: "ja",
+            version: 1
+          }
+        ]
+      }
+    });
+    expect(context.broker.published[0]?.payload).toMatchObject({
+      schemaId: STAGE_PAYLOAD_SCHEMA_IDS.publicationReadiness,
+      readinessStatus: "ready",
+      snapshotRefreshRequired: true
+    });
 
     await context.service.stop();
   });
@@ -392,5 +450,103 @@ function translationTaskPayload(): Readonly<Record<string, unknown>> {
     ],
     reason: "new_article",
     existingLanguageCodes: []
+  };
+}
+
+function createTranslationSummaryPersistenceDelivery(languageCode: string) {
+  const idempotencyKey = `translation:persistence:article-001:${languageCode}:v1`;
+
+  return {
+    envelope: createMinimalPersistenceEnvelope({
+      idempotencyKey
+    }),
+    payload: {
+      schemaId: STAGE_PAYLOAD_SCHEMA_IDS.persistenceCommand,
+      schemaVersion: STAGE_PAYLOAD_SCHEMA_VERSION,
+      pipelineRunId: "018f1598-2dd5-7c4f-9f92-8f7a7f8b3601",
+      stageExecutionId: languageCode === "fr"
+        ? "018f1598-2dd5-7c4f-9f92-8f7a7f8b5721"
+        : "018f1598-2dd5-7c4f-9f92-8f7a7f8b5722",
+      sourceMessageId: "018f1598-2dd5-7c4f-9f92-8f7a7f8b5701",
+      idempotencyKey,
+      traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+      producedAt: "2026-07-23T00:00:00.000Z",
+      commandId: languageCode === "fr"
+        ? "018f1598-2dd5-7c4f-9f92-8f7a7f8b5731"
+        : "018f1598-2dd5-7c4f-9f92-8f7a7f8b5732",
+      commandKind: "save_summaries",
+      backendOperation: "save-article-summaries-batch",
+      entityRefs: [
+        {
+          articleId: "article-001",
+          articleVersion: 1,
+          sourceLanguage: "en",
+          targetLanguage: languageCode,
+          summaryRef: {
+            kind: "backend-record",
+            uri: `backend://worker-uplift/translation/article-001/${languageCode}/summary`,
+            mediaType: "application/json",
+            articleId: "article-001",
+            targetLanguage: languageCode,
+            resultId: `translation-result-${languageCode}`
+          },
+          qualityRef: {
+            kind: "backend-record",
+            uri: `backend://worker-uplift/translation/article-001/${languageCode}/quality`,
+            mediaType: "application/json",
+            resultId: `translation-result-${languageCode}`
+          }
+        }
+      ],
+      writeMode: "upsert",
+      providerMode: "backend_postgres_primary"
+    },
+    receivedAt: "2026-07-23T00:00:01.000Z"
+  };
+}
+
+function createTranslationStatusPersistenceDelivery() {
+  const idempotencyKey = "translation:result:article-001:1";
+
+  return {
+    envelope: createMinimalPersistenceEnvelope({
+      idempotencyKey
+    }),
+    payload: {
+      schemaId: STAGE_PAYLOAD_SCHEMA_IDS.translationResult,
+      schemaVersion: STAGE_PAYLOAD_SCHEMA_VERSION,
+      pipelineRunId: "018f1598-2dd5-7c4f-9f92-8f7a7f8b3601",
+      stageExecutionId: "018f1598-2dd5-7c4f-9f92-8f7a7f8b5741",
+      sourceMessageId: "018f1598-2dd5-7c4f-9f92-8f7a7f8b5701",
+      idempotencyKey,
+      traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+      producedAt: "2026-07-23T00:00:00.000Z",
+      articleId: "article-001",
+      translationStatus: "complete",
+      completedLanguageCodes: [
+        "fr",
+        "ja"
+      ],
+      missingLanguageCodes: [],
+      summaryRefs: [
+        {
+          kind: "backend-record",
+          uri: "backend://worker-uplift/translation/article-001/fr/summary",
+          mediaType: "application/json",
+          articleId: "article-001",
+          targetLanguage: "fr",
+          resultId: "translation-result-fr"
+        },
+        {
+          kind: "backend-record",
+          uri: "backend://worker-uplift/translation/article-001/ja/summary",
+          mediaType: "application/json",
+          articleId: "article-001",
+          targetLanguage: "ja",
+          resultId: "translation-result-ja"
+        }
+      ]
+    },
+    receivedAt: "2026-07-23T00:00:01.000Z"
   };
 }

@@ -188,6 +188,11 @@ function parseFinalMaterializationRequest(context: RuntimeMessageContext): Parse
     aggregate: context.envelope.aggregate,
     payload
   });
+
+  if (isTranslationResultPayload(payload)) {
+    return parseTranslationResultMaterializationRequest(context, payload, payloadDigest);
+  }
+
   const commandId = requiredString(payload.commandId);
   const pipelineRunId = requiredString(payload.pipelineRunId);
   const stageExecutionId = requiredString(payload.stageExecutionId);
@@ -316,6 +321,125 @@ function parseFinalMaterializationRequest(context: RuntimeMessageContext): Parse
     ok: true,
     request
   };
+}
+
+function parseTranslationResultMaterializationRequest(
+  context: RuntimeMessageContext,
+  payload: Readonly<Record<string, unknown>>,
+  payloadDigest: string
+): ParseResult {
+  const pipelineRunId = requiredString(payload.pipelineRunId);
+  const stageExecutionId = requiredString(payload.stageExecutionId);
+  const sourceMessageId = requiredString(payload.sourceMessageId);
+  const idempotencyKey = requiredString(payload.idempotencyKey);
+  const traceparent = requiredString(payload.traceparent);
+  const producedAt = requiredString(payload.producedAt);
+  const articleId = requiredString(payload.articleId);
+  const articleVersion = positiveInteger(context.envelope.aggregate.version);
+  const completedLanguageCodes = stringArray(payload.completedLanguageCodes);
+  const missingLanguageCodes = stringArray(payload.missingLanguageCodes);
+
+  if (
+    pipelineRunId === undefined ||
+    stageExecutionId === undefined ||
+    sourceMessageId === undefined ||
+    idempotencyKey === undefined ||
+    traceparent === undefined ||
+    producedAt === undefined ||
+    articleId === undefined ||
+    articleVersion === undefined
+  ) {
+    return parseFailure("invalid-translation-result-materialization-command", payloadDigest, {
+      missingRequiredCommandField: true
+    });
+  }
+
+  if (idempotencyKey !== context.envelope.idempotencyKey) {
+    return parseFailure("idempotency-key-mismatch", payloadDigest, {
+      safeMetadataOnly: true
+    });
+  }
+
+  if (context.envelope.aggregate.id !== articleId) {
+    return parseFailure("envelope-aggregate-mismatch", payloadDigest, {
+      envelopeVersion: context.envelope.aggregate.version,
+      articleVersion
+    });
+  }
+
+  if (completedLanguageCodes.length === 0) {
+    return parseFailure("translation-result-has-no-completed-languages", payloadDigest, {
+      safeMetadataOnly: true
+    });
+  }
+
+  const summaryRefs = objectArray(payload.summaryRefs);
+  const translations = completedLanguageCodes.map((languageCode) => {
+    const summaryRef = summaryRefs.find((candidate) => requiredString(candidate.targetLanguage) === languageCode || requiredString(candidate.languageCode) === languageCode);
+    const uri = requiredString(summaryRef?.uri) ?? `backend://worker-uplift/translation/${encodeURIComponent(articleId)}/v${String(articleVersion)}/${encodeURIComponent(languageCode)}/summary`;
+
+    return {
+      languageCode,
+      uri,
+      version: articleVersion,
+      ...(typeof summaryRef?.digest === "string" && summaryRef.digest.length > 0 ? {
+        digest: summaryRef.digest
+      } : {})
+    } satisfies PersistenceTranslationStageResultReference;
+  });
+  const requiredLanguageCodes = uniqueStrings([
+    ...completedLanguageCodes,
+    ...missingLanguageCodes
+  ]);
+
+  return {
+    ok: true,
+    request: {
+      commandId: `translation-result:${articleId}:v${String(articleVersion)}`,
+      idempotencyKey,
+      messageId: context.envelope.messageId,
+      correlationId: context.envelope.correlationId,
+      pipelineRunId,
+      stageExecutionId,
+      sourceMessageId,
+      traceparent,
+      producedAt,
+      articleId,
+      articleVersion,
+      writeMode: "upsert",
+      payloadProviderMode: "backend_postgres_primary",
+      backendProviderMode: "backend_postgres_shadow",
+      payloadBackendOperation: "save-accepted-articles-batch",
+      backendOperation: "uplift-record-shadow-aggregate",
+      stageRefs: {
+        canonical: stageReferenceFor(articleId, articleVersion, "canonical"),
+        enrichment: stageReferenceFor(articleId, articleVersion, "enrichment"),
+        approval: stageReferenceFor(articleId, articleVersion, "approval"),
+        translations
+      },
+      requiredLanguageCodes: requiredLanguageCodes.length > 0 ? requiredLanguageCodes : DEFAULT_REQUIRED_LANGUAGE_CODES,
+      payloadDigest
+    }
+  };
+}
+
+function stageReferenceFor(articleId: string, articleVersion: number, stage: "canonical" | "enrichment" | "approval"): PersistenceStageResultReference {
+  return {
+    uri: `backend://worker-uplift/${stage}/${encodeURIComponent(articleId)}/v${String(articleVersion)}`,
+    version: articleVersion
+  };
+}
+
+function isTranslationResultPayload(payload: Readonly<Record<string, unknown>>): boolean {
+  return payload.schemaId === STAGE_PAYLOAD_SCHEMA_IDS.translationResult
+    && typeof payload.articleId === "string"
+    && Array.isArray(payload.completedLanguageCodes);
+}
+
+export function isTranslationSummaryPersistenceCommandPayload(payload: Readonly<Record<string, unknown>>): boolean {
+  return payload.schemaId === STAGE_PAYLOAD_SCHEMA_IDS.persistenceCommand
+    && payload.commandKind === "save_summaries"
+    && payload.backendOperation === "save-article-summaries-batch";
 }
 
 function validateStageInputs(
