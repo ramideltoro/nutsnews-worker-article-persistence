@@ -39,6 +39,7 @@ const DEFAULT_REQUIRED_LANGUAGE_CODES = [
   "de",
   "el"
 ] as const;
+const BACKEND_CAPTURED_PUBLICATION_POLICY_VERSION = "2026-07-23.worker-uplift-api-admin-compatibility-contract.v1";
 
 type JsonRecord = Readonly<Record<string, unknown>>;
 
@@ -489,6 +490,7 @@ function buildPublicationReadinessCommand(
     .map((translation) => translation.languageCode));
   const missingLanguageCodes = request.requiredLanguageCodes.filter((languageCode) => !availableLanguageCodes.includes(languageCode));
   const readinessStatus = aggregate.publicationStatus === "ready" ? "ready" : "blocked_missing_translations";
+  const sourceSummary = inputs.translations.find((translation) => translation.qualityStatus === "accepted");
   const payload = {
     schemaId: STAGE_PAYLOAD_SCHEMA_IDS.publicationReadiness,
     schemaVersion: STAGE_PAYLOAD_SCHEMA_VERSION,
@@ -508,8 +510,54 @@ function buildPublicationReadinessCommand(
       kind: "backend-record",
       uri: aggregate.payloadRef,
       mediaType: "application/json",
+      policyVersion: BACKEND_CAPTURED_PUBLICATION_POLICY_VERSION,
+      articleVersion: request.articleVersion,
+      currentArticleVersion: request.articleVersion,
       aggregateVersion: aggregate.aggregateVersion,
-      payloadDigest: aggregate.payloadDigest
+      finalAggregateVersion: aggregate.aggregateVersion,
+      payloadDigest: aggregate.payloadDigest,
+      canonicalIdentityHash: aggregate.articleIdentityHash,
+      canonicalIdentityValid: true,
+      enrichmentPolicyValid: aggregate.titleRef.trim().length > 0 && aggregate.imageUrlRef.trim().length > 0,
+      approvalStatus: inputs.approval.decision === "approved" ? "accepted" : inputs.approval.decision,
+      sourceSummaryPersisted: sourceSummary !== undefined,
+      ...(sourceSummary === undefined ? {} : {
+        persistedSourceSummaryRef: {
+          kind: "backend-record",
+          uri: sourceSummary.summaryRef,
+          mediaType: "application/json"
+        }
+      }),
+      processingState: "clear",
+      originalUrl: `shadow://article/${aggregate.articleIdentityHash}`,
+      operationVersion: "public-feed-snapshot-compat-v1",
+      publicFeedSnapshotRequest: {
+        limit: 6,
+        offset: 0,
+        category: "all",
+        languageCode: "en"
+      },
+      publicFeedSnapshot: {
+        id: request.articleId,
+        source: "worker-uplift-shadow",
+        title: "Sanitized public-feed compatibility title",
+        originalUrl: `shadow://article/${aggregate.articleIdentityHash}`,
+        imageUrl: "https://example.invalid/public-feed/article.jpg",
+        publishedAt: occurredAt,
+        publishedOnSiteAt: occurredAt,
+        aiSummary: "Sanitized public-feed compatibility summary.",
+        category: aggregate.category ?? "world",
+        positivityScore: aggregate.positivityScore ?? 0,
+        status: "published",
+        snapshotRank: 1
+      },
+      localizedSummaries: inputs.translations
+        .filter((translation) => translation.qualityStatus === "accepted")
+        .map((translation) => ({
+          languageCode: translation.languageCode,
+          title: "Sanitized localized public-feed title",
+          summary: "Sanitized localized public-feed summary."
+        }))
     }
   };
   const envelope = assertWorkerEnvelope({
