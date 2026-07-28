@@ -13,7 +13,8 @@ This bootstrap establishes the persistence service runtime, health/metrics surfa
 - Consumes the contracted `persistence` route and asserts the downstream `publication` route for future readiness events.
 - Accepts only stage payloads whose contract consumer is `persistence`.
 - Provides injectable persistence inbox, final-shadow transaction runner, approved stage-view reader, broker outbox, broker transport, backend Worker API client, clock, and work-handler boundaries.
-- Gates readiness on final-shadow write scope, approved stage-view read scope, exact backend Worker API compatibility, shadow mode, and disabled production domain writes.
+- Gates readiness on an active `persistence` main-queue consumer, final-shadow write scope, approved stage-view read scope, exact backend Worker API compatibility, shadow mode, and disabled production domain writes.
+- Emits bounded structured events and Prometheus metrics when RabbitMQ cancels the consumer, drops its channel, or restores consumption.
 - Uses a dedicated persistence database role for final worker-uplift shadow aggregate/inbox/outbox writes and approved stage result view reads.
 - Uses a separate scoped backend API identity for shadow and future domain commands; broad direct writes to `public` domain tables are not represented in this service.
 - Contains no feed/page network access, AI generation, translation generation, publication decision logic, or legacy production writer logic.

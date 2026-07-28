@@ -20,7 +20,8 @@ import type {
   RuntimeIdempotencyClaimContext,
   RuntimeIdempotencyClaimResult,
   RuntimeIdempotencyCompletion,
-  RuntimeIdempotencyFailure
+  RuntimeIdempotencyFailure,
+  RuntimeTelemetrySink
 } from "@ramideltoro/nutsnews-worker-runtime";
 import {
   Pool,
@@ -85,6 +86,7 @@ export type ProductionPersistenceDependencies = PersistenceDependencies & {
 interface ProductionPersistenceDependencyOptions {
   readonly config: PersistenceConfig;
   readonly clock: RuntimeClock;
+  readonly telemetry?: RuntimeTelemetrySink;
   readonly env?: NodeJS.ProcessEnv;
   readonly workHandler?: PersistenceWorkHandler;
 }
@@ -138,7 +140,10 @@ export function createProductionPersistenceDependencies(
   const brokerTransport = new PayloadRabbitMqTransport({
     url: requiredEnv(env, "NUTSNEWS_PERSISTENCE_RABBITMQ_URL"),
     prefetch: options.config.prefetch,
-    clock: options.clock
+    clock: options.clock,
+    ...(options.telemetry === undefined ? {} : {
+      telemetry: options.telemetry
+    })
   });
   const inboxStore = new PostgresPersistenceInboxStore(pool);
   const finalShadowTransactions = new PostgresPersistenceFinalShadowTransactionRunner(pool, options.config);

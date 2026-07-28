@@ -171,7 +171,10 @@ export function createPersistenceApplication(config = loadPersistenceConfig()): 
   const dependencies = config.dependencyMode === "production"
     ? createProductionPersistenceDependencies({
         config,
-        clock: SYSTEM_RUNTIME_CLOCK
+        clock: SYSTEM_RUNTIME_CLOCK,
+        ...(telemetry === undefined ? {} : {
+          telemetry
+        })
       })
     : createLocalPersistenceDependencies({
         clock: SYSTEM_RUNTIME_CLOCK

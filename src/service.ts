@@ -8,6 +8,7 @@ import {
 } from "@ramideltoro/nutsnews-worker-contracts";
 import {
   createBrokerLifecycle,
+  createBrokerConsumerReadinessCheck,
   createRuntimeHealthProbeSet,
   createRuntimeInFlightDrainController,
   emitRuntimeTelemetry,
@@ -128,6 +129,7 @@ export function createPersistenceService(options: PersistenceServiceOptions): Pe
         ],
         readinessChecks: [
           brokerReadinessCheck(broker),
+          createBrokerConsumerReadinessCheck(broker, "persistence"),
           dependencyReadinessCheck("persistence-inbox", options.dependencies.inboxStore),
           dependencyReadinessCheck("final-shadow-transactions", options.dependencies.finalShadowTransactions),
           dependencyReadinessCheck("stage-view-reader", options.dependencies.stageViewReader),
