@@ -281,6 +281,8 @@ function combineTelemetrySinks(
   };
 }
 
+export const SUPPORTED_RUNTIME_PACKAGE_VERSION = "0.5.0";
+
 function assertPackageCompatibility(): void {
   const contracts = getContractPackageMetadata();
   const runtime = getRuntimePackageMetadata();
@@ -291,7 +293,7 @@ function assertPackageCompatibility(): void {
     throw new Error(`Unsupported contracts package version ${contractsVersion}.`);
   }
 
-  if (runtimeVersion !== "0.4.0") {
+  if (runtimeVersion !== SUPPORTED_RUNTIME_PACKAGE_VERSION) {
     throw new Error(`Unsupported runtime package version ${runtimeVersion}.`);
   }
 }
