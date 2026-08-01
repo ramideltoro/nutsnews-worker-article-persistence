@@ -11,6 +11,7 @@ import {
 import { createBufferedRuntimeTelemetrySink } from "@ramideltoro/nutsnews-worker-runtime";
 
 import { PayloadRabbitMqTransport } from "../src/rabbitmq-payload-transport.js";
+import { createMinimalPersistenceEnvelope } from "../src/test-doubles.js";
 
 type CloseHandler = () => void;
 
@@ -29,6 +30,7 @@ interface FakeChannel {
   readonly cancelTags: string[];
   readonly consumeQueues: string[];
   readonly prefetchCalls: number[];
+  readonly publishCalls: number;
   emitConsumerCancel(index?: number): void;
   emitClose(): void;
   toConfirmChannel(): ConfirmChannel;
@@ -111,6 +113,33 @@ describe("RabbitMQ payload transport", () => {
       activeConsumers: 1
     });
   });
+
+  it("cancels a publish waiting on reconnect and never resumes it on a late connection", async () => {
+    const connection = createFakeConnection();
+    const deferredConnection = deferred<ChannelModel>();
+    const transport = new PayloadRabbitMqTransport({
+      url: "amqp://persistence:test@example.invalid:5672",
+      prefetch: 2,
+      clock,
+      connect: () => deferredConnection.promise
+    });
+    const controller = new AbortController();
+    const pendingPublish = transport.publishWithSignal({
+      envelope: createMinimalPersistenceEnvelope(),
+      payload: {}
+    }, controller.signal);
+
+    controller.abort(new Error("idempotency lease renewal failed"));
+
+    await expect(pendingPublish).rejects.toThrow("idempotency lease renewal failed");
+    deferredConnection.resolve(connection.toChannelModel());
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0);
+    });
+
+    expect(connection.channel.publishCalls).toBe(0);
+    await transport.close();
+  });
 });
 
 function createFakeBroker(): FakeBroker {
@@ -168,6 +197,7 @@ function createFakeChannel(): FakeChannel {
   const consumeQueues: string[] = [];
   const consumers: ((message: ConsumeMessage | null) => void)[] = [];
   const prefetchCalls: number[] = [];
+  let publishCalls = 0;
   const closeHandlers: CloseHandler[] = [];
   const channel = {
     prefetch(count: number): Promise<void> {
@@ -198,6 +228,20 @@ function createFakeChannel(): FakeChannel {
       }
 
       return channel;
+    },
+    off(): unknown {
+      return channel;
+    },
+    publish(
+      _exchange: string,
+      _routingKey: string,
+      _content: Buffer,
+      _options: unknown,
+      callback: (error: unknown) => void
+    ): boolean {
+      publishCalls += 1;
+      callback(null);
+      return true;
     }
   };
 
@@ -205,6 +249,9 @@ function createFakeChannel(): FakeChannel {
     cancelTags,
     consumeQueues,
     prefetchCalls,
+    get publishCalls(): number {
+      return publishCalls;
+    },
     emitConsumerCancel(index = consumers.length - 1): void {
       consumers[index]?.(null);
     },
@@ -215,6 +262,23 @@ function createFakeChannel(): FakeChannel {
     },
     toConfirmChannel(): ConfirmChannel {
       return channel as unknown as ConfirmChannel;
+    }
+  };
+}
+
+function deferred<T>(): {
+  readonly promise: Promise<T>;
+  resolve(value: T): void;
+} {
+  let resolvePromise: ((value: T) => void) | undefined;
+  const promise = new Promise<T>((resolve) => {
+    resolvePromise = resolve;
+  });
+
+  return {
+    promise,
+    resolve(value): void {
+      resolvePromise?.(value);
     }
   };
 }
