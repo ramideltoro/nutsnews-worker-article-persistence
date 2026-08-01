@@ -60,11 +60,14 @@ import type {
 import type {
   PersistenceBackendShadowAggregateCommand,
   PersistenceBackendShadowAggregateResult,
+  PersistenceBackendPrimaryWriteResult,
   PersistenceFinalMaterializationInputs,
   PersistenceFinalMaterializationRecord,
   PersistenceFinalMaterializationRequest,
   PersistenceFinalMaterializationWriteResult,
-  PersistenceQuarantineRecord
+  PersistenceQuarantineRecord,
+  PersistenceSaveAcceptedArticleCommand,
+  PersistenceSaveArticleSummariesCommand
 } from "./materialization-types.js";
 
 export class ManualPersistenceClock implements RuntimeClock {
@@ -383,7 +386,10 @@ export class LocalBackendWorkerApiClient implements PersistenceBackendWorkerApiC
   readonly name: string = "local-backend-worker-api";
   status: PersistenceDependencyProbe["status"] = "ok";
   version = "worker-api-v1";
+  productionDomainWritesEnabled = false;
   readonly shadowAggregateCommands: PersistenceBackendShadowAggregateCommand[] = [];
+  readonly acceptedArticleCommands: PersistenceSaveAcceptedArticleCommand[] = [];
+  readonly articleSummaryCommands: PersistenceSaveArticleSummariesCommand[] = [];
   failNextShadowAggregate = false;
   nextShadowAggregateError: Error | undefined;
   requiredScopes = [
@@ -408,7 +414,7 @@ export class LocalBackendWorkerApiClient implements PersistenceBackendWorkerApiC
       summary: versionMatches ? "backend Worker API compatibility ready" : "backend Worker API compatibility mismatch",
       version: this.version,
       requiredScopes: this.requiredScopes,
-      productionDomainWritesEnabled: false
+      productionDomainWritesEnabled: this.productionDomainWritesEnabled
     };
   }
 
@@ -458,6 +464,46 @@ export class LocalBackendWorkerApiClient implements PersistenceBackendWorkerApiC
         mode: "shadow",
         recorded: true,
         productionSideEffect: false
+      }
+    };
+  }
+
+  saveAcceptedArticle(command: PersistenceSaveAcceptedArticleCommand): PersistenceBackendPrimaryWriteResult {
+    return this.recordPrimary(command, this.acceptedArticleCommands, 1);
+  }
+
+  saveArticleSummaries(command: PersistenceSaveArticleSummariesCommand): PersistenceBackendPrimaryWriteResult {
+    return this.recordPrimary(command, this.articleSummaryCommands, command.summaries.length);
+  }
+
+  private recordPrimary<T extends PersistenceSaveAcceptedArticleCommand | PersistenceSaveArticleSummariesCommand>(
+    command: T,
+    commands: T[],
+    affectedCount: number
+  ): PersistenceBackendPrimaryWriteResult {
+    const payloadDigest = sha256Digest(command);
+    const existingDigest = this.receipts.get(command.idempotencyKey);
+
+    if (existingDigest !== undefined) {
+      if (existingDigest !== payloadDigest) {
+        throw new Error("backend-idempotency-conflict");
+      }
+      return {
+        status: "duplicate",
+        affectedCount,
+        response: {
+          ok: true,
+          duplicate: true
+        }
+      };
+    }
+    this.receipts.set(command.idempotencyKey, payloadDigest);
+    commands.push(command);
+    return {
+      status: "recorded",
+      affectedCount,
+      response: {
+        ok: true
       }
     };
   }
@@ -851,6 +897,15 @@ export function createLocalFinalMaterializationInputs(
       articleId: "article-001",
       articleVersion: 1,
       decision: "approved",
+      canonicalUrl: "https://publisher.example.test/community/article-001",
+      title: "Neighbors build a free community library",
+      description: "Residents created a shared library for local families.",
+      imageUrl: "https://publisher.example.test/images/article-001.jpg",
+      publishedAt: "2026-07-23T00:00:00.000Z",
+      category: "Community | Uplifting",
+      sourceSummary: "Neighbors created a free library that gives local families easier access to books.",
+      sourceLanguage: "en",
+      model: "qwen2.5:3b",
       positivityScore: 8.5,
       approvalVersion: 1
     },
@@ -859,6 +914,10 @@ export function createLocalFinalMaterializationInputs(
         articleId: "article-001",
         articleVersion: 1,
         languageCode: "fr",
+        sourceLanguage: "en",
+        title: "Des voisins créent une bibliothèque gratuite",
+        summary: "Des voisins ont créé une bibliothèque gratuite pour les familles du quartier.",
+        model: "qwen2.5:3b",
         summaryRef: "backend://worker-uplift/translation/article-001/fr/v1",
         qualityStatus: "accepted",
         translationVersion: 1
@@ -867,6 +926,10 @@ export function createLocalFinalMaterializationInputs(
         articleId: "article-001",
         articleVersion: 1,
         languageCode: "ja",
+        sourceLanguage: "en",
+        title: "住民が無料の地域図書館を開設",
+        summary: "住民が地域の家族のために無料の図書館を作りました。",
+        model: "qwen2.5:3b",
         summaryRef: "backend://worker-uplift/translation/article-001/ja/v1",
         qualityStatus: "accepted",
         translationVersion: 1
@@ -879,11 +942,16 @@ export function createLocalFinalMaterializationInputs(
 export function createLocalPersistenceDependencies(options: {
   readonly clock?: RuntimeClock;
   readonly workHandler?: PersistenceWorkHandler;
+  readonly productionDomainWritesEnabled?: boolean;
 } = {}): PersistenceDependencies {
   const clock = options.clock ?? new ManualPersistenceClock();
+  const backendApiClient = new LocalBackendWorkerApiClient();
+
+  backendApiClient.productionDomainWritesEnabled = options.productionDomainWritesEnabled ?? false;
   const dependencies: PersistenceDependencies = {
     adapterMode: "in_memory",
     stateStoreMode: "in_memory",
+    productionDomainWritesEnabled: options.productionDomainWritesEnabled ?? false,
     clock,
     inboxStore: new InMemoryPersistenceInboxStore(clock),
     finalShadowTransactions: new LocalFinalShadowTransactionRunner(),
@@ -891,7 +959,7 @@ export function createLocalPersistenceDependencies(options: {
     brokerOutbox: new LocalPersistenceBrokerOutbox(),
     feedHealthProjectionStore: new LocalFeedHealthProjectionStore(),
     brokerTransport: new LocalBrokerTransport(),
-    backendApiClient: new LocalBackendWorkerApiClient(),
+    backendApiClient,
     workHandler: options.workHandler ?? new LocalPersistenceWorkHandler()
   };
 

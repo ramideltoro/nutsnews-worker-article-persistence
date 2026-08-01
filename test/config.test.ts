@@ -5,6 +5,7 @@ import {
 } from "vitest";
 
 import {
+  PERSISTENCE_PRODUCTION_WRITE_CONFIRMATION,
   PersistenceConfigError,
   loadPersistenceConfig
 } from "../src/config.js";
@@ -29,7 +30,8 @@ describe("loadPersistenceConfig", () => {
       security: {
         databaseRole: "nutsnews_worker_persistence",
         backendApiIdentity: "worker-uplift-persistence",
-        productionWritesEnabled: false
+        productionWritesEnabled: false,
+        productionWriteConfirmationValid: false
       },
       shadowMode: true,
       dependencies: {
@@ -75,6 +77,25 @@ describe("loadPersistenceConfig", () => {
       NUTSNEWS_PERSISTENCE_SHADOW_MODE: "false",
       NUTSNEWS_PERSISTENCE_PRODUCTION_WRITES_ENABLED: "true"
     })).toThrow(PersistenceConfigError);
+  });
+
+  it("allows production materialization only with production adapters and the fixed protected confirmation", () => {
+    const config = loadPersistenceConfig({
+      NUTSNEWS_ENVIRONMENT: "production",
+      NUTSNEWS_PERSISTENCE_DEPENDENCY_MODE: "production",
+      NUTSNEWS_PERSISTENCE_BUILD_REVISION: "0123456789abcdef0123456789abcdef01234567",
+      NUTSNEWS_PERSISTENCE_DATABASE_URL: "postgres://example.invalid/worker",
+      NUTSNEWS_PERSISTENCE_RABBITMQ_URL: "amqp://example.invalid",
+      NUTSNEWS_PERSISTENCE_BACKEND_API_BASE_URL: "https://backend.example.invalid/worker",
+      NUTSNEWS_PERSISTENCE_BACKEND_API_TOKEN: "secret-not-real",
+      NUTSNEWS_PERSISTENCE_PRODUCTION_WRITES_ENABLED: "true",
+      NUTSNEWS_PERSISTENCE_PRODUCTION_WRITE_CONFIRMATION: PERSISTENCE_PRODUCTION_WRITE_CONFIRMATION
+    });
+
+    expect(config.security).toMatchObject({
+      productionWritesEnabled: true,
+      productionWriteConfirmationValid: true
+    });
   });
 
   it("rejects production environment with test dependency and state-store adapters", () => {
