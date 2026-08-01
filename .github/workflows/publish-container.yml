@@ -59,6 +59,8 @@ jobs:
           context: .
           push: true
           tags: ${{ env.IMAGE }}
+          build-args: |
+            BUILD_REVISION=${{ github.sha }}
           labels: |
             org.opencontainers.image.source=https://github.com/ramideltoro/nutsnews-worker-article-persistence
             org.opencontainers.image.revision=${{ github.sha }}

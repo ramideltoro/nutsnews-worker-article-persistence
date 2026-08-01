@@ -15,8 +15,8 @@ import {
   runtimeNow,
   type BrokerConsumerHandle,
   type BrokerLifecycle,
-  type PrometheusRuntimeTelemetrySink,
   type RuntimeHealthCheck,
+  type RuntimeHealthReport,
   type RuntimeHealthProbeSet,
   type RuntimeIdempotencyStore,
   type RuntimeMessageContext,
@@ -36,12 +36,18 @@ import { classifyPersistenceError } from "./errors.js";
 import type {
   PersistenceQuarantineRecord
 } from "./materialization-types.js";
+import type {
+  PersistenceHealthOutcome,
+  PersistenceHealthProbe,
+  PersistencePrometheusTelemetrySink,
+  PersistenceRuntimeMetricsSink
+} from "./telemetry.js";
 
 export interface PersistenceServiceOptions {
   readonly config: PersistenceConfig;
   readonly dependencies: PersistenceDependencies;
   readonly telemetry?: RuntimeTelemetrySink;
-  readonly metrics?: PrometheusRuntimeTelemetrySink;
+  readonly metrics?: PersistenceRuntimeMetricsSink;
 }
 
 export interface PersistenceService {
@@ -58,6 +64,7 @@ export interface PersistenceService {
 export function createPersistenceService(options: PersistenceServiceOptions): PersistenceService {
   const persistenceRoute = getWorkerRoute("persistence");
   const publicationRoute = getWorkerRoute("publication");
+  const telemetry = bestEffortTelemetrySink(options.telemetry);
   const broker = createBrokerLifecycle({
     transport: options.dependencies.brokerTransport,
     routes: [
@@ -65,8 +72,8 @@ export function createPersistenceService(options: PersistenceServiceOptions): Pe
       publicationRoute
     ],
     clock: options.dependencies.clock,
-    ...(options.telemetry === undefined ? {} : {
-      telemetry: options.telemetry
+    ...(telemetry === undefined ? {} : {
+      telemetry
     })
   });
   const drain = createRuntimeInFlightDrainController({
@@ -74,25 +81,27 @@ export function createPersistenceService(options: PersistenceServiceOptions): Pe
   });
   const processor = createPersistenceInputProcessor({
     dependencies: options.dependencies,
-    ...(options.telemetry === undefined ? {} : {
-      telemetry: options.telemetry
+    ...(telemetry === undefined ? {} : {
+      telemetry
     }),
     handler: async (context) => {
       try {
         return await drain.track(async () => {
-          options.metrics?.setInFlight(persistenceRoute.mainQueue.name, drain.inFlight);
+          setInFlight(options.metrics, persistenceRoute.mainQueue.name, drain.inFlight);
+          const dependencyStartedAtMs = options.dependencies.clock.now().getTime();
           const result = await options.dependencies.workHandler.handle(context, {
             publish: (command) => broker.publish(command),
             recordOutbox: (command, receipt) => options.dependencies.brokerOutbox.record(command, receipt),
             withTransaction: (operation) => options.dependencies.finalShadowTransactions.withTransaction(operation)
           });
 
-          await emitRuntimeTelemetry(options.telemetry, {
+          await emitRuntimeTelemetry(telemetry, {
             name: "runtime.dependency.observed",
             level: result.status === "ok" ? "info" : "warn",
             at: runtimeNow(options.dependencies.clock),
             stage: "persistence",
             queue: persistenceRoute.mainQueue.name,
+            durationMs: elapsedMs(options.dependencies.clock, dependencyStartedAtMs),
             outcome: result.status === "ok" ? "success" : result.status === "retry" ? "retry" : "failure",
             attributes: {
               event: "persistence.message.delegated",
@@ -108,7 +117,7 @@ export function createPersistenceService(options: PersistenceServiceOptions): Pe
           return result;
         });
       } finally {
-        options.metrics?.setInFlight(persistenceRoute.mainQueue.name, drain.inFlight);
+        setInFlight(options.metrics, persistenceRoute.mainQueue.name, drain.inFlight);
       }
     }
   });
@@ -120,7 +129,7 @@ export function createPersistenceService(options: PersistenceServiceOptions): Pe
       return broker;
     },
     get health(): RuntimeHealthProbeSet {
-      return createRuntimeHealthProbeSet({
+      const probes = createRuntimeHealthProbeSet({
         livenessChecks: [
           livenessCheck()
         ],
@@ -143,10 +152,12 @@ export function createPersistenceService(options: PersistenceServiceOptions): Pe
           productionWritesDisabledCheck(options.config)
         ],
         clock: options.dependencies.clock,
-        ...(options.telemetry === undefined ? {} : {
-          telemetry: options.telemetry
+        ...(telemetry === undefined ? {} : {
+          telemetry
         })
       });
+
+      return observeHealthProbes(probes, options.metrics);
     },
     get isStarted(): boolean {
       return started;
@@ -163,29 +174,21 @@ export function createPersistenceService(options: PersistenceServiceOptions): Pe
       }
 
       await broker.start();
-      consumer = await broker.consume("persistence", processor);
-      started = true;
-      options.metrics?.recordDependencyLatency(persistenceRoute.mainQueue.name, 0, "success");
-      options.metrics?.setInFlight(persistenceRoute.mainQueue.name, drain.inFlight);
-      await emitRuntimeTelemetry(options.telemetry, {
-        name: "runtime.dependency.observed",
-        level: "info",
-        at: runtimeNow(options.dependencies.clock),
-        stage: "persistence",
-        queue: persistenceRoute.mainQueue.name,
-        outcome: "success",
-        attributes: {
-          dependency: options.config.dependencyMode === "production"
-            ? "persistence-production-adapters"
-            : "persistence-shell",
-          mode: options.config.dependencyMode,
-          prefetch: options.config.prefetch,
-          concurrency: options.config.concurrency,
-          databaseRole: options.config.security.databaseRole,
-          backendApiIdentity: options.config.security.backendApiIdentity,
-          shadowMode: options.config.shadowMode
+      const brokerConsumer = await broker.consume("persistence", processor);
+      consumer = {
+        stage: brokerConsumer.stage,
+        cancel: async () => {
+          await brokerConsumer.cancel();
+          setHealthProbe(options.metrics, "readiness", "unhealthy");
         }
-      });
+      };
+      started = true;
+      setHealthProbe(options.metrics, "startup", "ok");
+      setInFlight(options.metrics, persistenceRoute.mainQueue.name, drain.inFlight);
+      await refreshReadinessBestEffort(
+        () => service.health.readiness(),
+        options.metrics
+      );
     },
     async stop(): Promise<void> {
       if (!started && broker.state === "closed") {
@@ -193,11 +196,13 @@ export function createPersistenceService(options: PersistenceServiceOptions): Pe
       }
 
       drain.stopAcceptingWork();
-      options.metrics?.setShutdownDraining(true);
+      setShutdownDraining(options.metrics, true);
       await drain.waitForDrain(options.config.shutdownTimeoutMs);
       await broker.stop("shutdown");
-      options.metrics?.setShutdownDraining(false);
-      options.metrics?.setInFlight(persistenceRoute.mainQueue.name, drain.inFlight);
+      setShutdownDraining(options.metrics, false);
+      setInFlight(options.metrics, persistenceRoute.mainQueue.name, drain.inFlight);
+      setHealthProbe(options.metrics, "startup", "unhealthy");
+      setHealthProbe(options.metrics, "readiness", "unhealthy");
       consumer = undefined;
       started = false;
     },
@@ -209,15 +214,116 @@ export function createPersistenceService(options: PersistenceServiceOptions): Pe
   return service;
 }
 
+function bestEffortTelemetrySink(sink: RuntimeTelemetrySink | undefined): RuntimeTelemetrySink | undefined {
+  if (sink === undefined) {
+    return undefined;
+  }
+
+  return {
+    emit: async (event) => {
+      try {
+        await sink.emit(event);
+      } catch {
+        // Telemetry is non-semantic and must never change message disposition.
+      }
+    }
+  };
+}
+
+function setInFlight(
+  metrics: PersistenceRuntimeMetricsSink | undefined,
+  queue: string,
+  value: number
+): void {
+  runBestEffort(() => metrics?.setInFlight(queue, value));
+}
+
+function setShutdownDraining(
+  metrics: PersistenceRuntimeMetricsSink | undefined,
+  draining: boolean
+): void {
+  runBestEffort(() => metrics?.setShutdownDraining(draining));
+}
+
+function setHealthProbe(
+  metrics: PersistenceRuntimeMetricsSink | undefined,
+  probe: PersistenceHealthProbe,
+  outcome: PersistenceHealthOutcome
+): void {
+  if (isPersistenceMetrics(metrics)) {
+    runBestEffort(() => metrics.setHealthProbe(probe, outcome));
+  }
+}
+
+function observeHealthProbes(
+  probes: RuntimeHealthProbeSet,
+  metrics: PersistenceRuntimeMetricsSink | undefined
+): RuntimeHealthProbeSet {
+  const observe = async <T extends RuntimeHealthReport>(
+    probe: PersistenceHealthProbe,
+    operation: () => Promise<T>
+  ): Promise<T> => {
+    const report = await operation();
+    setHealthProbe(metrics, probe, report.status);
+
+    return report;
+  };
+
+  return {
+    liveness: () => observe("liveness", () => probes.liveness()),
+    startup: () => observe("startup", () => probes.startup()),
+    readiness: () => observe("readiness", () => probes.readiness())
+  };
+}
+
+async function refreshReadinessBestEffort(
+  operation: () => Promise<RuntimeHealthReport>,
+  metrics: PersistenceRuntimeMetricsSink | undefined
+): Promise<void> {
+  try {
+    await operation();
+  } catch {
+    setHealthProbe(metrics, "readiness", "unhealthy");
+  }
+}
+
+function isPersistenceMetrics(
+  metrics: PersistenceRuntimeMetricsSink | undefined
+): metrics is PersistencePrometheusTelemetrySink {
+  return metrics !== undefined
+    && "setHealthProbe" in metrics
+    && typeof metrics.setHealthProbe === "function";
+}
+
+function runBestEffort(operation: () => unknown): void {
+  try {
+    const result = operation();
+
+    if (isPromiseLike(result)) {
+      void result.then(undefined, () => undefined);
+    }
+  } catch {
+    // Metrics are non-semantic and must never change message disposition.
+  }
+}
+
+function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
+  return typeof value === "object" && value !== null && "then" in value && typeof value.then === "function";
+}
+
 interface PersistenceInputProcessorOptions {
   readonly dependencies: PersistenceDependencies;
   readonly telemetry?: RuntimeTelemetrySink;
   handler(context: RuntimeMessageContext): Promise<{ readonly status: "ok" } | { readonly status: "retry"; readonly reason: string; readonly retryAfterMs?: number } | { readonly status: "terminal-failure"; readonly reason: string }>;
 }
 
+// Runtime 0.5.0 validates payload definition.stage. Persistence instead owns all
+// schemas whose definition.consumer is persistence, including translationResult,
+// so this processor preserves consumer-aware validation and mirrors runtime events.
 function createPersistenceInputProcessor(options: PersistenceInputProcessorOptions) {
   return async (delivery: RuntimeMessageDelivery): Promise<RuntimeMessageProcessingResult> => {
     const receivedAt = delivery.receivedAt ?? runtimeNow(options.dependencies.clock);
+    const startedAtMs = options.dependencies.clock.now().getTime();
     const queue = getWorkerRoute("persistence").mainQueue.name;
     await emitRuntimeTelemetry(options.telemetry, {
       name: "runtime.message.started",
@@ -231,46 +337,100 @@ function createPersistenceInputProcessor(options: PersistenceInputProcessorOptio
     const envelopeResult = validateWorkerEnvelope(delivery.envelope);
 
     if (!envelopeResult.ok) {
+      const issues = envelopeResult.issues.map(toRuntimeValidationIssue);
+      await emitInvalid(
+        options.telemetry,
+        undefined,
+        issues,
+        options.dependencies.clock,
+        queue,
+        elapsedMs(options.dependencies.clock, startedAtMs)
+      );
+
       return {
         action: "dlq",
         reason: "invalid-envelope",
-        issues: envelopeResult.issues.map(toRuntimeValidationIssue)
+        issues
       };
     }
 
     const envelope = envelopeResult.value;
 
     if (envelope.route !== "persistence") {
-      return terminalResult(envelope, "stage-mismatch", [
+      const issues = [
         {
           path: "$.route",
           code: "stage-mismatch",
           message: `Envelope route ${envelope.route} does not match processor stage persistence.`
         }
-      ]);
+      ];
+      await emitInvalid(
+        options.telemetry,
+        envelope,
+        issues,
+        options.dependencies.clock,
+        queue,
+        elapsedMs(options.dependencies.clock, startedAtMs)
+      );
+
+      return terminalResult(envelope, "stage-mismatch", issues);
     }
 
     const payloadResult = validateStagePayload(delivery.payload);
 
     if (!payloadResult.ok) {
-      return terminalResult(envelope, "invalid-payload", payloadResult.issues.map(toRuntimeValidationIssue));
+      const issues = payloadResult.issues.map(toRuntimeValidationIssue);
+      await emitInvalid(
+        options.telemetry,
+        envelope,
+        issues,
+        options.dependencies.clock,
+        queue,
+        elapsedMs(options.dependencies.clock, startedAtMs)
+      );
+
+      return terminalResult(envelope, "invalid-payload", issues);
     }
 
     if (payloadResult.definition.consumer !== "persistence") {
-      return terminalResult(envelope, "payload-consumer-mismatch", [
+      const issues = [
         {
           path: "$.schemaId",
           code: "payload-consumer-mismatch",
           message: `Payload schema consumer ${payloadResult.definition.consumer} does not match persistence.`
         }
-      ]);
+      ];
+      await emitInvalid(
+        options.telemetry,
+        envelope,
+        issues,
+        options.dependencies.clock,
+        queue,
+        elapsedMs(options.dependencies.clock, startedAtMs)
+      );
+
+      return terminalResult(envelope, "payload-consumer-mismatch", issues);
     }
 
     const payloadFingerprint = sha256Digest({
       aggregate: envelope.aggregate,
       payload: payloadResult.value
     });
-    const fingerprint = await options.dependencies.inboxStore.verifyPayloadFingerprint(envelope.idempotencyKey, payloadFingerprint);
+    let fingerprint: Awaited<ReturnType<PersistenceDependencies["inboxStore"]["verifyPayloadFingerprint"]>>;
+
+    try {
+      fingerprint = await options.dependencies.inboxStore.verifyPayloadFingerprint(envelope.idempotencyKey, payloadFingerprint);
+    } catch {
+      return completeProcessingFailure(
+        options.telemetry,
+        envelope,
+        "payload-fingerprint-verification-error",
+        true,
+        options.dependencies.clock,
+        queue,
+        startedAtMs
+      );
+    }
 
     if (fingerprint.status === "conflict") {
       try {
@@ -283,19 +443,64 @@ function createPersistenceInputProcessor(options: PersistenceInputProcessorOptio
           ));
         });
       } catch {
-        return retryOrDlq(envelope, "quarantine-record-error");
+        const result = retryOrDlq(envelope, "quarantine-record-error");
+        await emitRetryOrDlq(
+          options.telemetry,
+          result,
+          options.dependencies.clock,
+          queue,
+          elapsedMs(options.dependencies.clock, startedAtMs)
+        );
+
+        return result;
       }
 
-      return terminalResult(envelope, "idempotency-payload-conflict");
+      const result = terminalResult(envelope, "idempotency-payload-conflict");
+      await emitRetryOrDlq(
+        options.telemetry,
+        result,
+        options.dependencies.clock,
+        queue,
+        elapsedMs(options.dependencies.clock, startedAtMs)
+      );
+
+      return result;
     }
 
-    const claim = await options.dependencies.inboxStore.claim(envelope.idempotencyKey, {
-      envelope,
-      stage: "persistence",
-      receivedAt
-    });
+    let claim: Awaited<ReturnType<RuntimeIdempotencyStore["claim"]>>;
+
+    try {
+      claim = await options.dependencies.inboxStore.claim(envelope.idempotencyKey, {
+        envelope,
+        stage: "persistence",
+        receivedAt
+      });
+    } catch {
+      return completeProcessingFailure(
+        options.telemetry,
+        envelope,
+        "idempotency-claim-error",
+        true,
+        options.dependencies.clock,
+        queue,
+        startedAtMs
+      );
+    }
 
     if (claim.status === "already-completed") {
+      await emitRuntimeTelemetry(options.telemetry, {
+        name: "runtime.message.duplicate",
+        level: "info",
+        at: runtimeNow(options.dependencies.clock),
+        stage: "persistence",
+        ...envelopeTelemetryFields(envelope, queue, elapsedMs(options.dependencies.clock, startedAtMs)),
+        outcome: "duplicate",
+        attributes: {
+          firstSeenAt: claim.firstSeenAt,
+          completedAt: claim.completedAt
+        }
+      });
+
       return {
         action: "ack",
         reason: "duplicate",
@@ -304,7 +509,16 @@ function createPersistenceInputProcessor(options: PersistenceInputProcessorOptio
     }
 
     if (claim.status === "in-progress") {
-      return retryOrDlq(envelope, "idempotency-in-progress", 1_000);
+      const result = retryOrDlq(envelope, "idempotency-in-progress", 1_000);
+      await emitRetryOrDlq(
+        options.telemetry,
+        result,
+        options.dependencies.clock,
+        queue,
+        elapsedMs(options.dependencies.clock, startedAtMs)
+      );
+
+      return result;
     }
 
     const context: RuntimeMessageContext = {
@@ -314,36 +528,144 @@ function createPersistenceInputProcessor(options: PersistenceInputProcessorOptio
       receivedAt
     };
 
+    let result;
+
     try {
-      const result = await options.handler(context);
-
-      if (result.status === "ok") {
-        await markCompleted(options.dependencies.inboxStore, envelope, options.dependencies.clock);
-        return {
-          action: "ack",
-          reason: "handled",
-          envelope
-        };
-      }
-
-      if (result.status === "retry") {
-        await markFailed(options.dependencies.inboxStore, envelope, result.reason, true, options.dependencies.clock);
-        return retryOrDlq(envelope, result.reason, result.retryAfterMs);
-      }
-
-      await markFailed(options.dependencies.inboxStore, envelope, result.reason, false, options.dependencies.clock);
-      return terminalResult(envelope, result.reason);
+      result = await options.handler(context);
     } catch (error: unknown) {
       const classification = classifyPersistenceError(error);
+      const failureRecorded = await tryMarkFailed(
+        options.dependencies.inboxStore,
+        envelope,
+        classification.reason,
+        classification.retryable,
+        options.dependencies.clock
+      );
 
-      await markFailed(options.dependencies.inboxStore, envelope, classification.reason, classification.retryable, options.dependencies.clock);
-
-      if (classification.retryable) {
-        return retryOrDlq(envelope, classification.reason);
+      if (!failureRecorded) {
+        return completeProcessingFailure(
+          options.telemetry,
+          envelope,
+          "idempotency-failure-record-error",
+          true,
+          options.dependencies.clock,
+          queue,
+          startedAtMs
+        );
       }
 
-      return terminalResult(envelope, classification.reason);
+      return completeProcessingFailure(
+        options.telemetry,
+        envelope,
+        classification.reason,
+        classification.retryable,
+        options.dependencies.clock,
+        queue,
+        startedAtMs
+      );
     }
+
+    if (result.status === "ok") {
+      try {
+        await markCompleted(options.dependencies.inboxStore, envelope, options.dependencies.clock);
+      } catch {
+        await tryMarkFailed(
+          options.dependencies.inboxStore,
+          envelope,
+          "idempotency-completion-error",
+          true,
+          options.dependencies.clock
+        );
+
+        return completeProcessingFailure(
+          options.telemetry,
+          envelope,
+          "idempotency-completion-error",
+          true,
+          options.dependencies.clock,
+          queue,
+          startedAtMs
+        );
+      }
+
+      await emitRuntimeTelemetry(options.telemetry, {
+        name: "runtime.message.accepted",
+        level: "info",
+        at: runtimeNow(options.dependencies.clock),
+        stage: "persistence",
+        ...envelopeTelemetryFields(envelope, queue, elapsedMs(options.dependencies.clock, startedAtMs)),
+        outcome: "success"
+      });
+
+      return {
+        action: "ack",
+        reason: "handled",
+        envelope
+      };
+    }
+
+    if (result.status === "retry") {
+      const failureRecorded = await tryMarkFailed(
+        options.dependencies.inboxStore,
+        envelope,
+        result.reason,
+        true,
+        options.dependencies.clock
+      );
+
+      if (!failureRecorded) {
+        return completeProcessingFailure(
+          options.telemetry,
+          envelope,
+          "idempotency-failure-record-error",
+          true,
+          options.dependencies.clock,
+          queue,
+          startedAtMs
+        );
+      }
+
+      return completeProcessingFailure(
+        options.telemetry,
+        envelope,
+        result.reason,
+        true,
+        options.dependencies.clock,
+        queue,
+        startedAtMs,
+        result.retryAfterMs
+      );
+    }
+
+    const failureRecorded = await tryMarkFailed(
+      options.dependencies.inboxStore,
+      envelope,
+      result.reason,
+      false,
+      options.dependencies.clock
+    );
+
+    if (!failureRecorded) {
+      return completeProcessingFailure(
+        options.telemetry,
+        envelope,
+        "idempotency-failure-record-error",
+        true,
+        options.dependencies.clock,
+        queue,
+        startedAtMs
+      );
+    }
+
+    return completeProcessingFailure(
+      options.telemetry,
+      envelope,
+      result.reason,
+      false,
+      options.dependencies.clock,
+      queue,
+      startedAtMs
+    );
   };
 }
 
@@ -554,11 +876,143 @@ function terminalResult(
   };
 }
 
+async function completeProcessingFailure(
+  telemetry: RuntimeTelemetrySink | undefined,
+  envelope: WorkerMessageEnvelope,
+  reason: string,
+  retryable: boolean,
+  clock: PersistenceDependencies["clock"],
+  queue: string,
+  startedAtMs: number,
+  retryAfterMs?: number
+): Promise<RuntimeMessageProcessingResult> {
+  const result = retryable
+    ? retryOrDlq(envelope, reason, retryAfterMs)
+    : terminalResult(envelope, reason);
+
+  await emitRetryOrDlq(
+    telemetry,
+    result,
+    clock,
+    queue,
+    elapsedMs(clock, startedAtMs)
+  );
+
+  return result;
+}
+
 function toRuntimeValidationIssue(issue: StagePayloadValidationIssue | RuntimeValidationIssue): RuntimeValidationIssue {
   return {
     path: issue.path,
     code: issue.code,
     message: issue.message
+  };
+}
+
+async function emitInvalid(
+  telemetry: RuntimeTelemetrySink | undefined,
+  envelope: WorkerMessageEnvelope | undefined,
+  issues: readonly RuntimeValidationIssue[],
+  clock: PersistenceDependencies["clock"],
+  queue: string,
+  durationMs: number
+): Promise<void> {
+  const firstIssue = issues[0];
+  const attributes = firstIssue === undefined
+    ? undefined
+    : {
+        issueCode: firstIssue.code,
+        issuePath: firstIssue.path
+      };
+
+  await emitRuntimeTelemetry(telemetry, {
+    name: "runtime.message.invalid",
+    level: "warn",
+    at: runtimeNow(clock),
+    stage: "persistence",
+    queue,
+    durationMs,
+    outcome: "failure",
+    ...(envelope === undefined
+      ? {}
+      : envelopeTelemetryFields(envelope, queue, durationMs)),
+    ...(attributes === undefined
+      ? {}
+      : {
+          attributes
+        })
+  });
+}
+
+async function emitRetryOrDlq(
+  telemetry: RuntimeTelemetrySink | undefined,
+  result: RuntimeMessageProcessingResult,
+  clock: PersistenceDependencies["clock"],
+  queue: string,
+  durationMs: number
+): Promise<void> {
+  if (result.action === "retry") {
+    await emitRuntimeTelemetry(telemetry, {
+      name: "runtime.message.retry",
+      level: "warn",
+      at: runtimeNow(clock),
+      stage: "persistence",
+      ...envelopeTelemetryFields(result.envelope, queue, durationMs),
+      outcome: "retry",
+      attributes: {
+        reason: result.reason,
+        destination: result.destination.name
+      }
+    });
+
+    return;
+  }
+
+  if (result.action === "dlq") {
+    await emitRuntimeTelemetry(telemetry, {
+      name: "runtime.message.dlq",
+      level: "error",
+      at: runtimeNow(clock),
+      stage: "persistence",
+      ...(result.envelope === undefined
+        ? {}
+        : envelopeTelemetryFields(result.envelope, queue, durationMs)),
+      outcome: "dlq",
+      attributes: {
+        reason: result.reason,
+        destination: result.destination?.name ?? "unroutable"
+      }
+    });
+  }
+}
+
+function elapsedMs(clock: PersistenceDependencies["clock"], startedAtMs: number): number {
+  return Math.max(0, clock.now().getTime() - startedAtMs);
+}
+
+function envelopeTelemetryFields(
+  envelope: WorkerMessageEnvelope,
+  queue: string,
+  durationMs: number
+): Readonly<Record<string, string | number>> {
+  const base = {
+    messageId: envelope.messageId,
+    correlationId: envelope.correlationId,
+    causationId: envelope.causationId,
+    traceparent: envelope.traceparent,
+    idempotencyKey: envelope.idempotencyKey,
+    queue,
+    attempt: envelope.attempt.count,
+    durationMs
+  } as const;
+
+  if (envelope.tracestate === undefined) {
+    return base;
+  }
+
+  return {
+    ...base,
+    tracestate: envelope.tracestate
   };
 }
 
@@ -588,6 +1042,21 @@ async function markFailed(
     reason,
     retryable
   });
+}
+
+async function tryMarkFailed(
+  store: RuntimeIdempotencyStore,
+  envelope: WorkerMessageEnvelope,
+  reason: string,
+  retryable: boolean,
+  clock: PersistenceDependencies["clock"]
+): Promise<boolean> {
+  try {
+    await markFailed(store, envelope, reason, retryable, clock);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function createPayloadConflictQuarantineRecord(

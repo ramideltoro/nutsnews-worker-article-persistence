@@ -16,6 +16,7 @@ export interface PersistenceConfigVariable {
 
 export const PERSISTENCE_CONFIG_SCHEMA = [
   variable("NUTSNEWS_ENVIRONMENT", "Runtime environment label for logs and metrics.", false, false, "local"),
+  variable("NUTSNEWS_PERSISTENCE_BUILD_REVISION", "Immutable lowercase 40-character Git commit revision baked into the production image.", true, false, "development"),
   variable("NUTSNEWS_PERSISTENCE_HTTP_HOST", "Health and metrics bind host.", false, false, "0.0.0.0"),
   variable("NUTSNEWS_PERSISTENCE_HTTP_PORT", "Health and metrics bind port.", false, false, "8080"),
   variable("NUTSNEWS_PERSISTENCE_DEPENDENCY_MODE", "Use test dependencies locally or require production dependency presence.", false, false, "test"),
@@ -40,6 +41,7 @@ export interface PersistenceConfig {
   readonly serviceName: typeof PERSISTENCE_SERVICE_NAME;
   readonly serviceVersion: typeof PERSISTENCE_SERVICE_VERSION;
   readonly environment: string;
+  readonly buildRevision: string;
   readonly host: string;
   readonly http: {
     readonly host: string;
@@ -96,12 +98,15 @@ export function loadPersistenceConfig(env: NodeJS.ProcessEnv = process.env): Per
     requireConfigured("NUTSNEWS_PERSISTENCE_BACKEND_API_TOKEN", dependencies.backendApiCredentialConfigured, issues);
   }
 
+  const buildRevision = parseBuildRevision(env.NUTSNEWS_PERSISTENCE_BUILD_REVISION, dependencyMode, issues);
+
   const concurrency = parseInteger(env.NUTSNEWS_PERSISTENCE_CONCURRENCY, "NUTSNEWS_PERSISTENCE_CONCURRENCY", 2, 1, 16, issues);
   const prefetch = parseInteger(env.NUTSNEWS_PERSISTENCE_PREFETCH, "NUTSNEWS_PERSISTENCE_PREFETCH", 4, 1, 64, issues);
   const config: PersistenceConfig = {
     serviceName: PERSISTENCE_SERVICE_NAME,
     serviceVersion: PERSISTENCE_SERVICE_VERSION,
     environment: nonEmpty(env.NUTSNEWS_ENVIRONMENT, "local"),
+    buildRevision,
     host: nonEmpty(env.HOSTNAME, os.hostname()),
     http: {
       host: nonEmpty(env.NUTSNEWS_PERSISTENCE_HTTP_HOST, "0.0.0.0"),
@@ -186,6 +191,20 @@ function parseDependencyMode(value: string | undefined, issues: string[]): Persi
 
   issues.push("NUTSNEWS_PERSISTENCE_DEPENDENCY_MODE must be test or production.");
   return "test";
+}
+
+function parseBuildRevision(
+  value: string | undefined,
+  dependencyMode: PersistenceDependencyMode,
+  issues: string[]
+): string {
+  const revision = nonEmpty(value, "development");
+
+  if (dependencyMode === "production" && !/^[0-9a-f]{40}$/u.test(revision)) {
+    issues.push("NUTSNEWS_PERSISTENCE_BUILD_REVISION must be a lowercase 40-character Git commit SHA when NUTSNEWS_PERSISTENCE_DEPENDENCY_MODE=production.");
+  }
+
+  return revision;
 }
 
 function parseTelemetryLogMode(value: string | undefined, issues: string[]): PersistenceTelemetryLogMode {

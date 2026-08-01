@@ -15,6 +15,10 @@ This bootstrap establishes the persistence service runtime, health/metrics surfa
 - Provides injectable persistence inbox, final-shadow transaction runner, approved stage-view reader, broker outbox, broker transport, backend Worker API client, clock, and work-handler boundaries.
 - Gates readiness on an active `persistence` main-queue consumer, final-shadow write scope, approved stage-view read scope, exact backend Worker API compatibility, shadow mode, and disabled production domain writes.
 - Emits bounded structured events and Prometheus metrics when RabbitMQ cancels the consumer, drops its channel, or restores consumption.
+- Emits exactly one bounded completion event per delivery for accepted, duplicate, invalid, retry, or DLQ outcomes. The Prometheus surface preserves generic runtime metrics and adds `nutsnews_worker_uplift_stage_events_total`, a fixed-bucket `nutsnews_worker_uplift_stage_latency_seconds` histogram for Grafana stage SLOs, and `nutsnews_worker_expected_active=0` while persistence remains shadow-only; message and correlation identifiers remain structured-log metadata only.
+- Retains the runtime package's generic `_duration_ms` summaries temporarily for existing backend outage-report compatibility; the canonical stage duration is the fixed-bucket seconds histogram.
+- Exposes one-hot `nutsnews_worker_health_probe` gauges for liveness, startup, and readiness from the first scrape, transitions startup/readiness with the service lifecycle, and records generic dependency latency only when a real duration was measured.
+- Treats JSON, Prometheus, health, and lifecycle telemetry as independently best effort: a throwing or rejecting sink cannot change acknowledgement, idempotency, retry, or DLQ behavior.
 - Uses a dedicated persistence database role for final worker-uplift shadow aggregate/inbox/outbox writes and approved stage result view reads.
 - Uses a separate scoped backend API identity for shadow and future domain commands; broad direct writes to `public` domain tables are not represented in this service.
 - Contains no feed/page network access, AI generation, translation generation, publication decision logic, or legacy production writer logic.
@@ -43,6 +47,7 @@ The HTTP server exposes `/config-schema` with names, defaults, sensitivity, and 
 
 | Variable | Default | Production | Sensitive |
 | --- | --- | --- | --- |
+| `NUTSNEWS_PERSISTENCE_BUILD_REVISION` | `development` | required lowercase 40-character Git SHA | no |
 | `NUTSNEWS_PERSISTENCE_DATABASE_URL` | unset | required | yes |
 | `NUTSNEWS_PERSISTENCE_RABBITMQ_URL` | unset | required | yes |
 | `NUTSNEWS_PERSISTENCE_BACKEND_API_BASE_URL` | unset | required | yes |

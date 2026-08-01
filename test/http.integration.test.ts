@@ -1,7 +1,4 @@
 import {
-  createPrometheusRuntimeTelemetrySink
-} from "@ramideltoro/nutsnews-worker-runtime";
-import {
   afterEach,
   describe,
   expect,
@@ -18,7 +15,11 @@ import type {
   PersistenceReconciler
 } from "../src/reconciliation.js";
 import { createPersistenceService } from "../src/service.js";
-import { createLocalPersistenceDependencies } from "../src/test-doubles.js";
+import { createPersistencePrometheusTelemetrySink } from "../src/telemetry.js";
+import {
+  createLocalPersistenceDependencies,
+  createMinimalPersistenceDelivery
+} from "../src/test-doubles.js";
 
 describe("createPersistenceHttpServer", () => {
   let server: PersistenceHttpServer | undefined;
@@ -35,7 +36,7 @@ describe("createPersistenceHttpServer", () => {
       NUTSNEWS_PERSISTENCE_HTTP_PORT: "0",
       NUTSNEWS_PERSISTENCE_TELEMETRY_LOGS: "silent"
     });
-    const metrics = createPrometheusRuntimeTelemetrySink({
+    const metrics = createPersistencePrometheusTelemetrySink({
       identity: {
         service: config.serviceName,
         version: config.serviceVersion,
@@ -46,6 +47,7 @@ describe("createPersistenceHttpServer", () => {
     service = createPersistenceService({
       config,
       dependencies: createLocalPersistenceDependencies(),
+      telemetry: metrics,
       metrics
     });
     server = createPersistenceHttpServer({
@@ -55,6 +57,7 @@ describe("createPersistenceHttpServer", () => {
     });
 
     await service.start();
+    await service.processDelivery(createMinimalPersistenceDelivery());
     await server.listen();
 
     const live = await fetch(server.url("/live"));
@@ -64,7 +67,14 @@ describe("createPersistenceHttpServer", () => {
 
     expect(live.status).toBe(200);
     expect(ready.status).toBe(200);
-    expect(await metricsResponse.text()).toContain("nutsnews_worker_dependency_duration_ms");
+    const metricsBody = await metricsResponse.text();
+    expect(metricsBody).toContain("nutsnews_worker_dependency_duration_ms");
+    expect(metricsBody).toContain("nutsnews_worker_uplift_stage_events_total");
+    expect(metricsBody).toContain('nutsnews_worker_uplift_stage_latency_seconds_bucket{environment="local",service="persistence",le="30"} 1');
+    expect(metricsBody).toContain('nutsnews_worker_expected_active{environment="local",service="persistence"} 0');
+    expect(metricsBody).toContain('nutsnews_worker_health_probe{environment="local",service="persistence",probe="liveness",outcome="ok"} 1');
+    expect(metricsBody).toContain('nutsnews_worker_health_probe{environment="local",service="persistence",probe="startup",outcome="ok"} 1');
+    expect(metricsBody).toContain('nutsnews_worker_health_probe{environment="local",service="persistence",probe="readiness",outcome="ok"} 1');
     const schemaBody = await schema.json() as {
       readonly variables: readonly { readonly name: string; readonly sensitive: boolean }[];
     };
