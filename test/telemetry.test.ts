@@ -100,7 +100,8 @@ describe("persistence Prometheus telemetry", () => {
     expect(stageEvents).toHaveLength(PERSISTENCE_STAGE_METRIC_OUTCOMES.length);
 
     for (const outcome of PERSISTENCE_STAGE_METRIC_OUTCOMES) {
-      expect(stageEvents).toContain(`nutsnews_worker_uplift_stage_events_total{environment="production",service="persistence",outcome="${outcome}"} 1`);
+      const expected = outcome === "failure" ? "0" : "1";
+      expect(stageEvents).toContain(`nutsnews_worker_uplift_stage_events_total{environment="production",service="persistence",outcome="${outcome}"} ${expected}`);
     }
 
     expect(output).toContain('nutsnews_worker_uplift_stage_latency_seconds_bucket{environment="production",service="persistence",le="0.01"} 1');

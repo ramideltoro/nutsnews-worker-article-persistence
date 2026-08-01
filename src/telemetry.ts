@@ -28,7 +28,8 @@ export const PERSISTENCE_STAGE_METRIC_OUTCOMES = [
   "duplicate",
   "invalid",
   "retry",
-  "dlq"
+  "dlq",
+  "failure"
 ] as const;
 
 export type PersistenceStageMetricOutcome = (typeof PERSISTENCE_STAGE_METRIC_OUTCOMES)[number];
