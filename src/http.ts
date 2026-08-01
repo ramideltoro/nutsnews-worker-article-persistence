@@ -3,8 +3,7 @@ import { timingSafeEqual } from "node:crypto";
 import type { AddressInfo } from "node:net";
 
 import {
-  runtimeHealthEndpointResponse,
-  type PrometheusRuntimeTelemetrySink
+  runtimeHealthEndpointResponse
 } from "@ramideltoro/nutsnews-worker-runtime";
 
 import {
@@ -17,11 +16,12 @@ import {
   type PersistenceReconciler
 } from "./reconciliation.js";
 import type { PersistenceService } from "./service.js";
+import type { PersistenceRuntimeMetricsSink } from "./telemetry.js";
 
 export interface PersistenceHttpServerOptions {
   readonly config: PersistenceConfig;
   readonly service: PersistenceService;
-  readonly metrics?: PrometheusRuntimeTelemetrySink;
+  readonly metrics?: PersistenceRuntimeMetricsSink;
   readonly reconciler?: PersistenceReconciler;
   readonly reconciliationToken?: string;
 }

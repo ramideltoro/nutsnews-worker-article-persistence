@@ -19,6 +19,7 @@ import {
   type RuntimeClock,
   type RuntimeHandlerResult,
   type RuntimeIdempotencyClaimContext,
+  type RuntimeIdempotencyClaimReleaseResult,
   type RuntimeIdempotencyClaimResult,
   type RuntimeIdempotencyCompletion,
   type RuntimeIdempotencyFailure,
@@ -36,6 +37,7 @@ import type {
   PersistenceDependencyProbe,
   PersistenceFeedHealthProjectionStore,
   PersistenceFinalShadowTransactionRunner,
+  PersistenceInboxClaimRenewalResult,
   PersistenceInboxStore,
   PersistenceInboxFingerprintResult,
   PersistencePermissionProbe,
@@ -86,6 +88,7 @@ export class InMemoryPersistenceInboxStore implements PersistenceInboxStore {
   status: PersistenceDependencyProbe["status"] = "ok";
   private readonly store;
   private readonly fingerprints = new Map<string, string>();
+  private readonly ownedClaims = new Map<string, string>();
 
   constructor(clock: RuntimeClock = new ManualPersistenceClock()) {
     this.store = createInMemoryIdempotencyStore(clock);
@@ -98,8 +101,19 @@ export class InMemoryPersistenceInboxStore implements PersistenceInboxStore {
     };
   }
 
-  claim(idempotencyKey: string, context: RuntimeIdempotencyClaimContext): Promise<RuntimeIdempotencyClaimResult> {
-    return this.store.claim(idempotencyKey, context);
+  async claim(
+    idempotencyKey: string,
+    context: RuntimeIdempotencyClaimContext,
+    payloadFingerprint?: string
+  ): Promise<RuntimeIdempotencyClaimResult> {
+    void payloadFingerprint;
+    const claim = await this.store.claim(idempotencyKey, context);
+
+    if (claim.status === "claimed") {
+      this.ownedClaims.set(idempotencyKey, claim.claimToken);
+    }
+
+    return claim;
   }
 
   verifyPayloadFingerprint(idempotencyKey: string, fingerprint: string): Promise<PersistenceInboxFingerprintResult> {
@@ -124,12 +138,43 @@ export class InMemoryPersistenceInboxStore implements PersistenceInboxStore {
     });
   }
 
-  markCompleted(idempotencyKey: string, completion: RuntimeIdempotencyCompletion): Promise<void> {
-    return this.store.markCompleted(idempotencyKey, completion);
+  renewClaim(idempotencyKey: string, claimToken: string): Promise<PersistenceInboxClaimRenewalResult> {
+    return Promise.resolve(this.ownedClaims.get(idempotencyKey) === claimToken
+      ? {
+          status: "renewed"
+        }
+      : {
+          status: "not-owned"
+        });
   }
 
-  markFailed(idempotencyKey: string, failure: RuntimeIdempotencyFailure): Promise<void> {
-    return this.store.markFailed(idempotencyKey, failure);
+  async markCompleted(idempotencyKey: string, completion: RuntimeIdempotencyCompletion): Promise<void> {
+    await this.store.markCompleted(idempotencyKey, completion);
+    this.clearOwnedClaim(idempotencyKey, completion.claimToken);
+  }
+
+  async markFailed(idempotencyKey: string, failure: RuntimeIdempotencyFailure): Promise<void> {
+    await this.store.markFailed(idempotencyKey, failure);
+    this.clearOwnedClaim(idempotencyKey, failure.claimToken);
+  }
+
+  releaseClaim(
+    idempotencyKey: string,
+    failure: RuntimeIdempotencyFailure
+  ): Promise<RuntimeIdempotencyClaimReleaseResult> {
+    return this.store.releaseClaim(idempotencyKey, failure).then((result) => {
+      if (result.status === "released") {
+        this.clearOwnedClaim(idempotencyKey, failure.claimToken);
+      }
+
+      return result;
+    });
+  }
+
+  private clearOwnedClaim(idempotencyKey: string, claimToken: string): void {
+    if (this.ownedClaims.get(idempotencyKey) === claimToken) {
+      this.ownedClaims.delete(idempotencyKey);
+    }
   }
 }
 
@@ -690,9 +735,10 @@ export class LocalPersistenceWorkHandler implements PersistenceWorkHandler {
   onHandleStart: (() => void) | undefined;
 
   async handle(context: RuntimeMessageContext, tools: PersistenceWorkTools): Promise<RuntimeHandlerResult> {
-    void tools;
+    tools.signal.throwIfAborted();
     this.onHandleStart?.();
     await this.handleGate;
+    tools.signal.throwIfAborted();
     this.handled.push(context);
 
     return this.result;
@@ -836,6 +882,8 @@ export function createLocalPersistenceDependencies(options: {
 } = {}): PersistenceDependencies {
   const clock = options.clock ?? new ManualPersistenceClock();
   const dependencies: PersistenceDependencies = {
+    adapterMode: "in_memory",
+    stateStoreMode: "in_memory",
     clock,
     inboxStore: new InMemoryPersistenceInboxStore(clock),
     finalShadowTransactions: new LocalFinalShadowTransactionRunner(),

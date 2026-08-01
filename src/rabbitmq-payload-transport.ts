@@ -33,6 +33,7 @@ import {
 
 const DEFAULT_CONFIRM_TIMEOUT_MS = WORKER_DELIVERY_BEHAVIOR.confirmTimeoutMs;
 const DEFAULT_DRAIN_TIMEOUT_MS = 30_000;
+const RABBITMQ_SETUP_OPERATION_TIMEOUT_MS = 10_000;
 
 interface PayloadCarrier {
   readonly envelope: WorkerMessageEnvelope;
@@ -45,7 +46,10 @@ interface PayloadConsumerRegistration {
   consumerTag: string | undefined;
 }
 
-type RabbitMqConnect = (url: string) => Promise<ChannelModel>;
+type RabbitMqConnect = (
+  url: string,
+  socketOptions?: { readonly timeout?: number }
+) => Promise<ChannelModel>;
 
 export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
   readonly name = "rabbitmq-payload-transport";
@@ -59,6 +63,7 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
   private readonly inFlight = new Set<Promise<void>>();
   private connection: ChannelModel | undefined;
   private channel: ConfirmChannel | undefined;
+  private channelSetup: Promise<ConfirmChannel> | undefined;
   private routes: readonly WorkerRoute[] = [];
   private closing = false;
   private reconnecting: Promise<void> | undefined;
@@ -97,8 +102,17 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
   }
 
   async publish(command: BrokerPublishCommand): Promise<BrokerPublishReceipt> {
+    return this.publishWithSignal(command);
+  }
+
+  async publishWithSignal(
+    command: BrokerPublishCommand,
+    signal?: AbortSignal
+  ): Promise<BrokerPublishReceipt> {
+    signal?.throwIfAborted();
     const route = getWorkerRoute(command.envelope.route);
-    const channel = await this.ensureChannel();
+    const channel = await this.ensureChannel(signal);
+    signal?.throwIfAborted();
 
     await publishCarrierWithConfirm(channel, {
       carrier: {
@@ -107,8 +121,12 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
       },
       exchange: route.exchange,
       routingKey: route.routingKey,
-      confirmTimeoutMs: DEFAULT_CONFIRM_TIMEOUT_MS
+      confirmTimeoutMs: DEFAULT_CONFIRM_TIMEOUT_MS,
+      ...(signal === undefined ? {} : {
+        signal
+      })
     });
+    signal?.throwIfAborted();
 
     return {
       messageId: command.envelope.messageId,
@@ -200,7 +218,9 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
     }
   }
 
-  private async ensureChannel(): Promise<ConfirmChannel> {
+  private async ensureChannel(signal?: AbortSignal): Promise<ConfirmChannel> {
+    signal?.throwIfAborted();
+
     if (this.channel !== undefined) {
       return this.channel;
     }
@@ -209,8 +229,72 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
       throw new Error("RabbitMQ payload transport is closing.");
     }
 
-    const connection = await this.connectToBroker(this.url);
-    const channel = await connection.createConfirmChannel();
+    if (this.channelSetup === undefined) {
+      const setup = this.createAndInstallChannel();
+      const tracked = setup.finally(() => {
+        if (this.channelSetup === tracked) {
+          this.channelSetup = undefined;
+        }
+      });
+      this.channelSetup = tracked;
+    }
+
+    const channel = await waitForRabbitMqOperation(this.channelSetup, {
+      timeoutMs: RABBITMQ_SETUP_OPERATION_TIMEOUT_MS * 2,
+      operation: "RabbitMQ connection and confirm-channel setup",
+      ...(signal === undefined ? {} : {
+        signal
+      })
+    });
+    signal?.throwIfAborted();
+
+    return channel;
+  }
+
+  private async createAndInstallChannel(): Promise<ConfirmChannel> {
+    const connection = await waitForRabbitMqOperation(
+      this.connectToBroker(this.url, {
+        timeout: RABBITMQ_SETUP_OPERATION_TIMEOUT_MS
+      }),
+      {
+        timeoutMs: RABBITMQ_SETUP_OPERATION_TIMEOUT_MS,
+        operation: "RabbitMQ connection",
+        disposeLateResult: async (lateConnection) => {
+          await lateConnection.close().catch(() => undefined);
+        }
+      }
+    );
+    let channel: ConfirmChannel;
+
+    try {
+      if (this.closing) {
+        throw new Error("RabbitMQ payload transport is closing.");
+      }
+
+      channel = await waitForRabbitMqOperation(connection.createConfirmChannel(), {
+        timeoutMs: RABBITMQ_SETUP_OPERATION_TIMEOUT_MS,
+        operation: "RabbitMQ confirm-channel creation",
+        disposeLateResult: async (lateChannel) => {
+          await lateChannel.close().catch(() => undefined);
+        }
+      });
+    } catch (error: unknown) {
+      await connection.close().catch(() => undefined);
+      throw error;
+    }
+
+    if (this.isClosing()) {
+      await channel.close().catch(() => undefined);
+      await connection.close().catch(() => undefined);
+      throw new Error("RabbitMQ payload transport is closing.");
+    }
+
+    if (this.channel !== undefined) {
+      await channel.close().catch(() => undefined);
+      await connection.close().catch(() => undefined);
+      return this.channel;
+    }
+
     this.connection = connection;
     this.channel = channel;
     this.clearReconnectRetry();
@@ -236,9 +320,15 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
       this.markChannelClosed(channel, "channel-error");
     });
 
-    await this.restoreConsumers(channel);
+    void this.restoreConsumers(channel).catch(() => {
+      this.markChannelClosed(channel, "consumer-restoration-failed");
+    });
 
     return channel;
+  }
+
+  private isClosing(): boolean {
+    return this.closing;
   }
 
   private async restoreConsumers(channel: ConfirmChannel): Promise<void> {
@@ -275,6 +365,11 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
     }, {
       noAck: false
     });
+
+    if (this.closing || this.channel !== channel || this.consumers.get(stage) !== registration) {
+      await channel.cancel(reply.consumerTag).catch(() => undefined);
+      return;
+    }
 
     registration.consumerTag = reply.consumerTag;
     registration.monitor.markActive("consumer-registered");
@@ -425,6 +520,7 @@ async function publishCarrierWithConfirm(
     readonly routingKey: string;
     readonly confirmTimeoutMs: number;
     readonly retryJitterMs?: number;
+    readonly signal?: AbortSignal;
   }
 ): Promise<void> {
   const content = Buffer.from(JSON.stringify(options.carrier), "utf8");
@@ -440,6 +536,7 @@ async function publishCarrierWithConfirm(
       channel.off("return", onReturn);
       channel.off("close", onClose);
       channel.off("error", onChannelError);
+      options.signal?.removeEventListener("abort", onAbort);
       settled = true;
     };
     const fail = (error: Error): void => {
@@ -461,6 +558,9 @@ async function publishCarrierWithConfirm(
     const onChannelError = (): void => {
       fail(new Error("RabbitMQ channel errored during publish."));
     };
+    const onAbort = (): void => {
+      fail(abortError(options.signal, "RabbitMQ publish cancelled after idempotency ownership was lost."));
+    };
 
     timeout = setTimeout(() => {
       fail(new Error("RabbitMQ publish confirm timed out."));
@@ -469,6 +569,15 @@ async function publishCarrierWithConfirm(
     channel.on("return", onReturn);
     channel.on("close", onClose);
     channel.on("error", onChannelError);
+    options.signal?.addEventListener("abort", onAbort, {
+      once: true
+    });
+
+    if (options.signal?.aborted === true) {
+      onAbort();
+      return;
+    }
+
     channel.publish(
       options.exchange,
       options.routingKey,
@@ -487,6 +596,78 @@ async function publishCarrierWithConfirm(
       }
     );
   });
+}
+
+function waitForRabbitMqOperation<T>(
+  pending: Promise<T>,
+  options: {
+    readonly timeoutMs: number;
+    readonly operation: string;
+    readonly signal?: AbortSignal;
+    readonly disposeLateResult?: (value: T) => void | Promise<void>;
+  }
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const timer: { value: ReturnType<typeof setTimeout> | undefined } = {
+      value: undefined
+    };
+    const cleanup = (): void => {
+      if (timer.value !== undefined) {
+        clearTimeout(timer.value);
+      }
+
+      options.signal?.removeEventListener("abort", onAbort);
+    };
+    const fail = (error: Error): void => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      cleanup();
+      reject(error);
+    };
+    const onAbort = (): void => {
+      fail(abortError(options.signal, `${options.operation} cancelled after idempotency ownership was lost.`));
+    };
+
+    pending.then(
+      (value) => {
+        if (settled) {
+          if (options.disposeLateResult !== undefined) {
+            void Promise.resolve(options.disposeLateResult(value)).catch(() => undefined);
+          }
+          return;
+        }
+
+        settled = true;
+        cleanup();
+        resolve(value);
+      },
+      (error: unknown) => {
+        fail(error instanceof Error ? error : new Error(`${options.operation} failed.`));
+      }
+    );
+
+    timer.value = setTimeout(() => {
+      fail(new Error(`${options.operation} timed out after ${String(options.timeoutMs)}ms.`));
+    }, options.timeoutMs);
+    timer.value.unref();
+    options.signal?.addEventListener("abort", onAbort, {
+      once: true
+    });
+
+    if (options.signal?.aborted === true) {
+      onAbort();
+    }
+  });
+}
+
+function abortError(signal: AbortSignal | undefined, fallback: string): Error {
+  return signal?.reason instanceof Error
+    ? signal.reason
+    : new Error(fallback);
 }
 
 function decodeCarrier(message: ConsumeMessage): PayloadCarrier {

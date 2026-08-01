@@ -18,6 +18,7 @@ describe("loadPersistenceConfig", () => {
     expect(config).toMatchObject({
       serviceName: "nutsnews-worker-article-persistence",
       dependencyMode: "test",
+      buildRevision: "development",
       host: "persistence-host",
       concurrency: 2,
       prefetch: 4,
@@ -57,7 +58,8 @@ describe("loadPersistenceConfig", () => {
         "NUTSNEWS_PERSISTENCE_DATABASE_URL is required when NUTSNEWS_PERSISTENCE_DEPENDENCY_MODE=production.",
         "NUTSNEWS_PERSISTENCE_RABBITMQ_URL is required when NUTSNEWS_PERSISTENCE_DEPENDENCY_MODE=production.",
         "NUTSNEWS_PERSISTENCE_BACKEND_API_BASE_URL is required when NUTSNEWS_PERSISTENCE_DEPENDENCY_MODE=production.",
-        "NUTSNEWS_PERSISTENCE_BACKEND_API_TOKEN is required when NUTSNEWS_PERSISTENCE_DEPENDENCY_MODE=production."
+        "NUTSNEWS_PERSISTENCE_BACKEND_API_TOKEN is required when NUTSNEWS_PERSISTENCE_DEPENDENCY_MODE=production.",
+        "NUTSNEWS_PERSISTENCE_BUILD_REVISION must be a lowercase 40-character Git commit SHA when NUTSNEWS_PERSISTENCE_DEPENDENCY_MODE=production."
       ]);
       expect(configError.message).not.toContain("postgres://");
       expect(configError.message).not.toContain("amqp://");
@@ -75,9 +77,20 @@ describe("loadPersistenceConfig", () => {
     })).toThrow(PersistenceConfigError);
   });
 
+  it("rejects production environment with test dependency and state-store adapters", () => {
+    expect(() => loadPersistenceConfig({
+      NUTSNEWS_ENVIRONMENT: "production",
+      NUTSNEWS_PERSISTENCE_DEPENDENCY_MODE: "test"
+    })).toThrow(
+      "NUTSNEWS_PERSISTENCE_DEPENDENCY_MODE must be production when NUTSNEWS_ENVIRONMENT=production"
+    );
+  });
+
   it("accepts production dependency presence without retaining values", () => {
     const config = loadPersistenceConfig({
+      NUTSNEWS_ENVIRONMENT: "production",
       NUTSNEWS_PERSISTENCE_DEPENDENCY_MODE: "production",
+      NUTSNEWS_PERSISTENCE_BUILD_REVISION: "0123456789abcdef0123456789abcdef01234567",
       NUTSNEWS_PERSISTENCE_DATABASE_URL: "postgres://example.invalid/worker",
       NUTSNEWS_PERSISTENCE_RABBITMQ_URL: "amqp://example.invalid",
       NUTSNEWS_PERSISTENCE_BACKEND_API_BASE_URL: "https://backend.example.invalid/worker",
@@ -91,6 +104,8 @@ describe("loadPersistenceConfig", () => {
       backendApiConfigured: true,
       backendApiCredentialConfigured: true
     });
+    expect(config.environment).toBe("production");
+    expect(config.buildRevision).toBe("0123456789abcdef0123456789abcdef01234567");
     expect(JSON.stringify(config)).not.toContain("postgres://example.invalid");
     expect(JSON.stringify(config)).not.toContain("amqp://example.invalid");
     expect(JSON.stringify(config)).not.toContain("backend.example.invalid");

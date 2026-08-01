@@ -18,6 +18,7 @@ import type {
   RuntimeBrokerTransport,
   RuntimeClock,
   RuntimeIdempotencyClaimContext,
+  RuntimeIdempotencyClaimReleaseResult,
   RuntimeIdempotencyClaimResult,
   RuntimeIdempotencyCompletion,
   RuntimeIdempotencyFailure,
@@ -57,6 +58,7 @@ import type {
   PersistenceDependencyProbe,
   PersistenceFeedHealthProjectionStore,
   PersistenceFinalShadowTransactionRunner,
+  PersistenceInboxClaimRenewalResult,
   PersistenceInboxFingerprintResult,
   PersistenceInboxStore,
   PersistencePermissionProbe,
@@ -76,6 +78,8 @@ import type {
 const PERSISTENCE_SCHEMA = "worker_uplift_persistence";
 const FINAL_SCHEMA = "worker_uplift_final";
 const VIEWS_SCHEMA = "worker_uplift_views";
+export const PERSISTENCE_IDEMPOTENCY_LEASE_MS = 300_000;
+const PERSISTENCE_DATABASE_OPERATION_TIMEOUT_MS = 10_000;
 
 export type ProductionPersistenceDependencies = PersistenceDependencies & {
   readonly reconciler: PersistenceReconciler;
@@ -135,7 +139,10 @@ export function createProductionPersistenceDependencies(
   const pool = new Pool({
     connectionString: requiredEnv(env, "NUTSNEWS_PERSISTENCE_DATABASE_URL"),
     max: Math.max(3, options.config.concurrency + 2),
-    application_name: options.config.serviceName
+    application_name: options.config.serviceName,
+    connectionTimeoutMillis: PERSISTENCE_DATABASE_OPERATION_TIMEOUT_MS,
+    query_timeout: PERSISTENCE_DATABASE_OPERATION_TIMEOUT_MS,
+    statement_timeout: PERSISTENCE_DATABASE_OPERATION_TIMEOUT_MS
   });
   const brokerTransport = new PayloadRabbitMqTransport({
     url: requiredEnv(env, "NUTSNEWS_PERSISTENCE_RABBITMQ_URL"),
@@ -163,6 +170,8 @@ export function createProductionPersistenceDependencies(
     expectedVersion: options.config.compatibility.backendApiVersion
   });
   const dependencies: Omit<ProductionPersistenceDependencies, "workHandler" | "close"> = {
+    adapterMode: "production",
+    stateStoreMode: "postgresql",
     clock: options.clock,
     inboxStore,
     finalShadowTransactions,
@@ -187,11 +196,37 @@ export function createProductionPersistenceDependencies(
   };
 }
 
+interface PostgresPersistenceInboxStoreOptions {
+  readonly claimTokenFactory?: () => string;
+  readonly leaseMs?: number;
+}
+
+interface PersistenceInboxClaimRow extends QueryResultRow {
+  readonly status: string;
+  readonly payload_digest: string;
+  readonly received_at: Date;
+  readonly processed_at: Date | null;
+  readonly claim_token: string | null;
+  readonly claim_lease_expires_at_epoch_ms: string | null;
+  readonly claim_control_invalid: boolean;
+}
+
 export class PostgresPersistenceInboxStore implements PersistenceInboxStore {
   readonly name = "postgres-persistence-inbox";
-  private readonly pendingFingerprints = new Map<string, string>();
+  readonly claimLeaseMs: number;
+  private readonly claimTokenFactory: () => string;
 
-  constructor(private readonly pool: Pool) {}
+  constructor(
+    private readonly pool: Pool,
+    options: PostgresPersistenceInboxStoreOptions = {}
+  ) {
+    this.claimTokenFactory = options.claimTokenFactory ?? randomUUID;
+    this.claimLeaseMs = options.leaseMs ?? PERSISTENCE_IDEMPOTENCY_LEASE_MS;
+
+    if (!Number.isInteger(this.claimLeaseMs) || this.claimLeaseMs <= 0 || this.claimLeaseMs > PERSISTENCE_IDEMPOTENCY_LEASE_MS) {
+      throw new Error("Persistence idempotency lease must be a positive integer no longer than five minutes.");
+    }
+  }
 
   async probe(): Promise<PersistenceDependencyProbe> {
     return probePool(this.pool, "persistence inbox database ready");
@@ -217,7 +252,6 @@ export class PostgresPersistenceInboxStore implements PersistenceInboxStore {
           };
     }
 
-    this.pendingFingerprints.set(idempotencyKey, fingerprint);
     return {
       status: "accepted"
     };
@@ -225,9 +259,11 @@ export class PostgresPersistenceInboxStore implements PersistenceInboxStore {
 
   async claim(
     idempotencyKey: string,
-    context: RuntimeIdempotencyClaimContext
+    context: RuntimeIdempotencyClaimContext,
+    payloadFingerprint?: string
   ): Promise<RuntimeIdempotencyClaimResult> {
-    const payloadDigest = this.pendingFingerprints.get(idempotencyKey)
+    const claimToken = this.claimTokenFactory();
+    const payloadDigest = payloadFingerprint
       ?? context.envelope.payloadRef.digest
       ?? sha256Digest(context.envelope.payloadRef);
     const inserted = await this.pool.query<{ readonly received_at: Date }>(
@@ -235,7 +271,13 @@ export class PostgresPersistenceInboxStore implements PersistenceInboxStore {
         message_id, pipeline_run_id, stage_execution_id, source_stage, source_message_id,
         entity_kind, entity_id, schema_version, operation_version, idempotency_key,
         payload_ref, payload_digest, received_at, status, diagnostic_metadata
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::timestamptz, 'processing', $14::jsonb)
+      ) VALUES (
+        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::timestamptz, 'processing',
+        $14::jsonb || jsonb_build_object(
+          'claimToken', $15::text,
+          'claimLeaseExpiresAtEpochMs', floor(extract(epoch from clock_timestamp() + ($16::integer * interval '1 millisecond')) * 1000)::bigint
+        )
+      )
       ON CONFLICT (idempotency_key) DO NOTHING
       RETURNING received_at`,
       [
@@ -256,26 +298,54 @@ export class PostgresPersistenceInboxStore implements PersistenceInboxStore {
           route: context.envelope.route,
           attempt: context.envelope.attempt,
           payloadFingerprint: payloadDigest
-        })
+        }),
+        claimToken,
+        this.claimLeaseMs
       ]
     );
-
-    this.pendingFingerprints.delete(idempotencyKey);
 
     if ((inserted.rowCount ?? 0) > 0) {
       return {
         status: "claimed",
         firstSeenAt: context.receivedAt,
-        replay: false
+        replay: false,
+        claimToken
       };
     }
 
-    const existing = await this.pool.query<{
-      readonly status: string;
-      readonly received_at: Date;
-      readonly processed_at: Date | null;
-    }>(
-      `SELECT status, received_at, processed_at
+    const existing = await this.pool.query<PersistenceInboxClaimRow>(
+      `SELECT
+         status,
+         payload_digest,
+         received_at,
+         processed_at,
+         CASE
+           WHEN jsonb_typeof(diagnostic_metadata) = 'object'
+             AND jsonb_typeof(diagnostic_metadata->'claimToken') = 'string'
+             AND length(diagnostic_metadata->>'claimToken') BETWEEN 1 AND 256
+             THEN diagnostic_metadata->>'claimToken'
+           ELSE NULL
+         END AS claim_token,
+         CASE
+           WHEN jsonb_typeof(diagnostic_metadata) = 'object'
+             AND jsonb_typeof(diagnostic_metadata->'claimLeaseExpiresAtEpochMs') = 'number'
+             AND (diagnostic_metadata->>'claimLeaseExpiresAtEpochMs')::numeric > 0
+             AND (diagnostic_metadata->>'claimLeaseExpiresAtEpochMs')::numeric
+               = trunc((diagnostic_metadata->>'claimLeaseExpiresAtEpochMs')::numeric)
+             AND (diagnostic_metadata->>'claimLeaseExpiresAtEpochMs')::numeric <= 9007199254740991
+             THEN diagnostic_metadata->>'claimLeaseExpiresAtEpochMs'
+           ELSE NULL
+         END AS claim_lease_expires_at_epoch_ms,
+         CASE
+           WHEN jsonb_typeof(diagnostic_metadata) IS DISTINCT FROM 'object' THEN true
+           WHEN jsonb_typeof(diagnostic_metadata->'claimToken') IS DISTINCT FROM 'string' THEN true
+           WHEN length(diagnostic_metadata->>'claimToken') NOT BETWEEN 1 AND 256 THEN true
+           WHEN jsonb_typeof(diagnostic_metadata->'claimLeaseExpiresAtEpochMs') IS DISTINCT FROM 'number' THEN true
+           ELSE (diagnostic_metadata->>'claimLeaseExpiresAtEpochMs')::numeric <= 0
+             OR (diagnostic_metadata->>'claimLeaseExpiresAtEpochMs')::numeric
+               <> trunc((diagnostic_metadata->>'claimLeaseExpiresAtEpochMs')::numeric)
+             OR (diagnostic_metadata->>'claimLeaseExpiresAtEpochMs')::numeric > 9007199254740991
+         END AS claim_control_invalid
        FROM ${PERSISTENCE_SCHEMA}.inbox
        WHERE idempotency_key = $1`,
       [idempotencyKey]
@@ -289,6 +359,10 @@ export class PostgresPersistenceInboxStore implements PersistenceInboxStore {
       };
     }
 
+    if (row.payload_digest !== payloadDigest) {
+      throw new Error("Conflicting payload fingerprint observed while acquiring idempotency claim.");
+    }
+
     const firstSeenAt = row.received_at.toISOString();
 
     if (row.status === "processed" || row.status === "duplicate") {
@@ -299,28 +373,155 @@ export class PostgresPersistenceInboxStore implements PersistenceInboxStore {
       };
     }
 
-    if (row.status === "failed" || row.status === "parked") {
-      await this.pool.query(
+    if (row.status === "received") {
+      const acquired = await this.pool.query(
         `UPDATE ${PERSISTENCE_SCHEMA}.inbox
          SET status = 'processing',
+             processed_at = NULL,
              sanitized_error_code = NULL,
              sanitized_error_message = NULL,
-             diagnostic_metadata = diagnostic_metadata || $2::jsonb
-         WHERE idempotency_key = $1`,
+             diagnostic_metadata = (
+               CASE
+                 WHEN jsonb_typeof(diagnostic_metadata) = 'object' THEN diagnostic_metadata
+                 ELSE '{}'::jsonb
+               END - 'claimToken' - 'claimLeaseExpiresAtEpochMs'
+             ) || $3::jsonb || jsonb_build_object(
+               'claimToken', $4::text,
+               'claimLeaseExpiresAtEpochMs', floor(extract(epoch from clock_timestamp() + ($5::integer * interval '1 millisecond')) * 1000)::bigint
+             )
+         WHERE idempotency_key = $1
+           AND payload_digest = $2
+           AND status = 'received'`,
         [
           idempotencyKey,
+          payloadDigest,
           JSON.stringify({
             replayedAt: context.receivedAt,
             replayMessageId: context.envelope.messageId
-          })
+          }),
+          claimToken,
+          this.claimLeaseMs
+        ]
+      );
+
+      return (acquired.rowCount ?? 0) === 1
+        ? {
+            status: "claimed",
+            firstSeenAt,
+            replay: true,
+            claimToken
+          }
+        : {
+            status: "in-progress",
+            firstSeenAt
+          };
+    }
+
+    const previousClaimToken = row.claim_token ?? undefined;
+    const previousLeaseExpiresAt = row.claim_lease_expires_at_epoch_ms ?? undefined;
+    const controlMetadataInvalid = row.claim_control_invalid;
+
+    if (row.status === "processing" && controlMetadataInvalid) {
+      await this.pool.query(
+        `UPDATE ${PERSISTENCE_SCHEMA}.inbox
+         SET diagnostic_metadata = (
+           CASE
+             WHEN jsonb_typeof(diagnostic_metadata) = 'object' THEN diagnostic_metadata
+             ELSE '{}'::jsonb
+           END - 'claimToken' - 'claimLeaseExpiresAtEpochMs'
+         ) || jsonb_build_object(
+           'claimToken', $2::text,
+           'claimLeaseExpiresAtEpochMs', floor(extract(epoch from clock_timestamp() + ($3::integer * interval '1 millisecond')) * 1000)::bigint,
+           'claimControlNormalizedAt', clock_timestamp()
+         )
+         WHERE idempotency_key = $1
+           AND status = 'processing'
+           AND (
+             jsonb_typeof(diagnostic_metadata) IS DISTINCT FROM 'object'
+             OR
+             jsonb_typeof(diagnostic_metadata->'claimToken') IS DISTINCT FROM 'string'
+             OR length(diagnostic_metadata->>'claimToken') NOT BETWEEN 1 AND 256
+             OR CASE
+               WHEN jsonb_typeof(diagnostic_metadata->'claimLeaseExpiresAtEpochMs') = 'number'
+                 THEN (diagnostic_metadata->>'claimLeaseExpiresAtEpochMs')::numeric <= 0
+                   OR (diagnostic_metadata->>'claimLeaseExpiresAtEpochMs')::numeric
+                     <> trunc((diagnostic_metadata->>'claimLeaseExpiresAtEpochMs')::numeric)
+                   OR (diagnostic_metadata->>'claimLeaseExpiresAtEpochMs')::numeric > 9007199254740991
+               ELSE true
+             END
+           )`,
+        [
+          idempotencyKey,
+          claimToken,
+          this.claimLeaseMs
         ]
       );
 
       return {
-        status: "claimed",
-        firstSeenAt,
-        replay: true
+        status: "in-progress",
+        firstSeenAt
       };
+    }
+
+    const reclaimable = row.status === "failed"
+      || row.status === "parked"
+      || (row.status === "processing" && previousLeaseExpiresAt !== undefined);
+
+    if (reclaimable) {
+      const reclaimed = await this.pool.query<{ readonly received_at: Date }>(
+        `UPDATE ${PERSISTENCE_SCHEMA}.inbox
+         SET status = 'processing',
+             processed_at = NULL,
+             sanitized_error_code = NULL,
+             sanitized_error_message = NULL,
+             diagnostic_metadata = (
+               CASE
+                 WHEN jsonb_typeof(diagnostic_metadata) = 'object' THEN diagnostic_metadata
+                 ELSE '{}'::jsonb
+               END - 'claimToken' - 'claimLeaseExpiresAtEpochMs'
+             ) || $4::jsonb || jsonb_build_object(
+               'claimToken', $6::text,
+               'claimLeaseExpiresAtEpochMs', floor(extract(epoch from clock_timestamp() + ($7::integer * interval '1 millisecond')) * 1000)::bigint
+             )
+         WHERE idempotency_key = $1
+           AND status = $2
+           AND (
+             status IN ('failed', 'parked')
+             OR (
+               status = 'processing'
+               AND (diagnostic_metadata->>'claimToken') IS NOT DISTINCT FROM $3
+               AND (diagnostic_metadata->>'claimLeaseExpiresAtEpochMs') IS NOT DISTINCT FROM $5
+               AND CASE
+                 WHEN jsonb_typeof(diagnostic_metadata->'claimLeaseExpiresAtEpochMs') = 'number'
+                   THEN (diagnostic_metadata->>'claimLeaseExpiresAtEpochMs')::numeric
+                 ELSE NULL
+               END
+                 <= floor(extract(epoch from clock_timestamp()) * 1000)::bigint
+             )
+           )
+         RETURNING received_at`,
+        [
+          idempotencyKey,
+          row.status,
+          previousClaimToken ?? null,
+          JSON.stringify({
+            replayedAt: context.receivedAt,
+            replayMessageId: context.envelope.messageId
+          }),
+          previousLeaseExpiresAt ?? null,
+          claimToken,
+          this.claimLeaseMs
+        ]
+      );
+
+      if ((reclaimed.rowCount ?? 0) > 0) {
+        return {
+          status: "claimed",
+          firstSeenAt,
+          replay: true,
+          claimToken
+        };
+      }
     }
 
     return {
@@ -330,31 +531,62 @@ export class PostgresPersistenceInboxStore implements PersistenceInboxStore {
   }
 
   async markCompleted(idempotencyKey: string, completion: RuntimeIdempotencyCompletion): Promise<void> {
-    await this.pool.query(
+    const completed = await this.pool.query(
       `UPDATE ${PERSISTENCE_SCHEMA}.inbox
        SET status = 'processed',
            processed_at = $2::timestamptz,
-           diagnostic_metadata = diagnostic_metadata || $3::jsonb
-       WHERE idempotency_key = $1`,
+           diagnostic_metadata = (
+             CASE
+               WHEN jsonb_typeof(diagnostic_metadata) = 'object' THEN diagnostic_metadata
+               ELSE '{}'::jsonb
+             END - 'claimToken' - 'claimLeaseExpiresAtEpochMs'
+           ) || $3::jsonb
+       WHERE idempotency_key = $1
+         AND status = 'processing'
+         AND diagnostic_metadata->>'claimToken' = $4
+         AND CASE
+           WHEN jsonb_typeof(diagnostic_metadata->'claimLeaseExpiresAtEpochMs') = 'number'
+             THEN (diagnostic_metadata->>'claimLeaseExpiresAtEpochMs')::numeric
+           ELSE NULL
+         END
+           > floor(extract(epoch from clock_timestamp()) * 1000)::bigint`,
       [
         idempotencyKey,
         completion.completedAt,
         JSON.stringify({
           completedMessageId: completion.messageId,
           completedStage: completion.stage
-        })
+        }),
+        completion.claimToken
       ]
     );
+
+    if ((completed.rowCount ?? 0) !== 1) {
+      throw new Error("Cannot complete an idempotency claim owned by another delivery.");
+    }
   }
 
   async markFailed(idempotencyKey: string, failure: RuntimeIdempotencyFailure): Promise<void> {
-    await this.pool.query(
+    const failed = await this.pool.query(
       `UPDATE ${PERSISTENCE_SCHEMA}.inbox
        SET status = 'failed',
            sanitized_error_code = $2,
            sanitized_error_message = $3,
-           diagnostic_metadata = diagnostic_metadata || $4::jsonb
-       WHERE idempotency_key = $1`,
+           diagnostic_metadata = (
+             CASE
+               WHEN jsonb_typeof(diagnostic_metadata) = 'object' THEN diagnostic_metadata
+               ELSE '{}'::jsonb
+             END - 'claimToken' - 'claimLeaseExpiresAtEpochMs'
+           ) || $4::jsonb
+       WHERE idempotency_key = $1
+         AND status = 'processing'
+         AND diagnostic_metadata->>'claimToken' = $5
+         AND CASE
+           WHEN jsonb_typeof(diagnostic_metadata->'claimLeaseExpiresAtEpochMs') = 'number'
+             THEN (diagnostic_metadata->>'claimLeaseExpiresAtEpochMs')::numeric
+           ELSE NULL
+         END
+           > floor(extract(epoch from clock_timestamp()) * 1000)::bigint`,
       [
         idempotencyKey,
         sanitizeCode(failure.reason),
@@ -363,9 +595,113 @@ export class PostgresPersistenceInboxStore implements PersistenceInboxStore {
           failedAt: failure.failedAt,
           failedMessageId: failure.messageId,
           retryable: failure.retryable
-        })
+        }),
+        failure.claimToken
       ]
     );
+
+    if ((failed.rowCount ?? 0) !== 1) {
+      throw new Error("Cannot fail an idempotency claim owned by another delivery.");
+    }
+  }
+
+  async releaseClaim(
+    idempotencyKey: string,
+    failure: RuntimeIdempotencyFailure
+  ): Promise<RuntimeIdempotencyClaimReleaseResult> {
+    const released = await this.pool.query(
+      `UPDATE ${PERSISTENCE_SCHEMA}.inbox
+       SET status = 'failed',
+           sanitized_error_code = $2,
+           sanitized_error_message = $3,
+           diagnostic_metadata = (
+             CASE
+               WHEN jsonb_typeof(diagnostic_metadata) = 'object' THEN diagnostic_metadata
+               ELSE '{}'::jsonb
+             END - 'claimToken' - 'claimLeaseExpiresAtEpochMs'
+           ) || $4::jsonb
+       WHERE idempotency_key = $1
+         AND status = 'processing'
+         AND diagnostic_metadata->>'claimToken' = $5
+         AND CASE
+           WHEN jsonb_typeof(diagnostic_metadata->'claimLeaseExpiresAtEpochMs') = 'number'
+             THEN (diagnostic_metadata->>'claimLeaseExpiresAtEpochMs')::numeric
+           ELSE NULL
+         END
+           > floor(extract(epoch from clock_timestamp()) * 1000)::bigint`,
+      [
+        idempotencyKey,
+        sanitizeCode(failure.reason),
+        sanitizeMessage(failure.reason),
+        JSON.stringify({
+          releasedAt: failure.failedAt,
+          releasedMessageId: failure.messageId,
+          releaseReason: failure.reason,
+          retryable: failure.retryable
+        }),
+        failure.claimToken
+      ]
+    );
+
+    if ((released.rowCount ?? 0) === 1) {
+      return {
+        status: "released"
+      };
+    }
+
+    const current = await this.pool.query<{ readonly status: string }>(
+      `SELECT status
+       FROM ${PERSISTENCE_SCHEMA}.inbox
+       WHERE idempotency_key = $1`,
+      [idempotencyKey]
+    );
+
+    return current.rows[0]?.status === "processed" || current.rows[0]?.status === "duplicate"
+      ? {
+          status: "preserved-completed"
+        }
+      : {
+          status: "not-owned"
+        };
+  }
+
+  async renewClaim(
+    idempotencyKey: string,
+    claimToken: string
+  ): Promise<PersistenceInboxClaimRenewalResult> {
+    const renewed = await this.pool.query(
+      `UPDATE ${PERSISTENCE_SCHEMA}.inbox
+       SET diagnostic_metadata = (
+         CASE
+           WHEN jsonb_typeof(diagnostic_metadata) = 'object' THEN diagnostic_metadata
+           ELSE '{}'::jsonb
+         END
+       ) || jsonb_build_object(
+         'claimLeaseExpiresAtEpochMs', floor(extract(epoch from clock_timestamp() + ($3::integer * interval '1 millisecond')) * 1000)::bigint
+       )
+       WHERE idempotency_key = $1
+         AND status = 'processing'
+         AND diagnostic_metadata->>'claimToken' = $2
+         AND CASE
+           WHEN jsonb_typeof(diagnostic_metadata->'claimLeaseExpiresAtEpochMs') = 'number'
+             THEN (diagnostic_metadata->>'claimLeaseExpiresAtEpochMs')::numeric
+           ELSE NULL
+         END
+           > floor(extract(epoch from clock_timestamp()) * 1000)::bigint`,
+      [
+        idempotencyKey,
+        claimToken,
+        this.claimLeaseMs
+      ]
+    );
+
+    return (renewed.rowCount ?? 0) === 1
+      ? {
+          status: "renewed"
+        }
+      : {
+          status: "not-owned"
+        };
   }
 }
 

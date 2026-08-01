@@ -79,6 +79,8 @@ export class PersistenceRoutingWorkHandler implements PersistenceWorkHandler {
   ) {}
 
   handle(context: RuntimeMessageContext, tools: PersistenceWorkTools): RuntimeHandlerResult | Promise<RuntimeHandlerResult> {
+    tools.signal.throwIfAborted();
+
     if (isFeedHealthProjectionPayload(context.payload)) {
       return this.feedHealthProjectionHandler.handle(context, tools);
     }
@@ -98,7 +100,8 @@ export class FeedHealthProjectionHandler implements PersistenceWorkHandler {
 
   constructor(private readonly dependencies: PersistenceDependencies) {}
 
-  async handle(context: RuntimeMessageContext): Promise<RuntimeHandlerResult> {
+  async handle(context: RuntimeMessageContext, tools: PersistenceWorkTools): Promise<RuntimeHandlerResult> {
+    tools.signal.throwIfAborted();
     const parsed = parseFeedHealthProjectionEvent(context);
 
     if (!parsed.ok) {
@@ -109,6 +112,7 @@ export class FeedHealthProjectionHandler implements PersistenceWorkHandler {
     }
 
     const result = await this.dependencies.feedHealthProjectionStore.project(parsed.event);
+    tools.signal.throwIfAborted();
 
     if (result.status === "conflict") {
       return {

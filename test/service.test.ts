@@ -4,7 +4,7 @@ import {
 } from "@ramideltoro/nutsnews-worker-contracts";
 import {
   createBufferedRuntimeTelemetrySink,
-  createPrometheusRuntimeTelemetrySink
+  type RuntimeTelemetrySink
 } from "@ramideltoro/nutsnews-worker-runtime";
 import {
   describe,
@@ -14,6 +14,7 @@ import {
 
 import { loadPersistenceConfig } from "../src/config.js";
 import { createPersistenceService } from "../src/service.js";
+import { createPersistencePrometheusTelemetrySink } from "../src/telemetry.js";
 import {
   InMemoryPersistenceInboxStore,
   LocalBackendWorkerApiClient,
@@ -43,7 +44,7 @@ describe("createPersistenceService", () => {
     expect((await context.service.health.liveness()).status).toBe("ok");
     expect((await context.service.health.startup()).status).toBe("ok");
     expect((await context.service.health.readiness()).status).toBe("ok");
-    expect(context.metrics.collect()).toContain("nutsnews_worker_dependency_duration_ms");
+    expect(context.metrics.collect()).not.toContain("nutsnews_worker_dependency_duration_ms");
 
     await context.service.stop();
 
@@ -73,6 +74,14 @@ describe("createPersistenceService", () => {
     expect(context.backendApi.shadowAggregateCommands).toHaveLength(1);
     expect(context.broker.published).toHaveLength(1);
     expect(context.outbox.records).toHaveLength(1);
+    expect(context.telemetry.events
+      .filter((event) => event.name.startsWith("runtime.message."))
+      .map((event) => event.name)).toEqual([
+      "runtime.message.started",
+      "runtime.message.accepted",
+      "runtime.message.started",
+      "runtime.message.duplicate"
+    ]);
     const shadowCommand = context.backendApi.shadowAggregateCommands[0];
 
     expect(shadowCommand?.shadowAggregate.payloadDigest).toMatch(/^sha256:/);
@@ -141,6 +150,12 @@ describe("createPersistenceService", () => {
     });
 
     expect(context.finalShadow.materializations).toHaveLength(0);
+    expect(context.telemetry.events
+      .filter((event) => event.name.startsWith("runtime.message."))
+      .map((event) => event.name)).toEqual([
+      "runtime.message.started",
+      "runtime.message.invalid"
+    ]);
 
     await context.service.stop();
   });
@@ -406,7 +421,7 @@ function createServiceContext(options: {
     })
   });
   const telemetry = createBufferedRuntimeTelemetrySink();
-  const metrics = createPrometheusRuntimeTelemetrySink({
+  const metrics = createPersistencePrometheusTelemetrySink({
     identity: {
       service: config.serviceName,
       version: config.serviceVersion,
@@ -414,10 +429,16 @@ function createServiceContext(options: {
       host: config.host
     }
   });
+  const serviceTelemetry: RuntimeTelemetrySink = {
+    async emit(event) {
+      await telemetry.emit(event);
+      await metrics.emit(event);
+    }
+  };
   const service = createPersistenceService({
     config,
     dependencies,
-    telemetry,
+    telemetry: serviceTelemetry,
     metrics
   });
 

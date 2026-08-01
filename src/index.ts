@@ -3,7 +3,6 @@ import { pathToFileURL } from "node:url";
 import { getContractPackageMetadata } from "@ramideltoro/nutsnews-worker-contracts";
 import {
   createJsonRuntimeTelemetrySink,
-  createPrometheusRuntimeTelemetrySink,
   createRuntimeShutdownController,
   getRuntimePackageMetadata,
   SYSTEM_RUNTIME_CLOCK,
@@ -14,10 +13,12 @@ import {
   loadPersistenceConfig,
   type PersistenceConfig
 } from "./config.js";
+import type { PersistenceDependencies } from "./dependencies.js";
 import { createPersistenceHttpServer } from "./http.js";
 import { createProductionPersistenceDependencies } from "./production.js";
 import type { PersistenceReconciler } from "./reconciliation.js";
 import { createPersistenceService } from "./service.js";
+import { createPersistencePrometheusTelemetrySink } from "./telemetry.js";
 import { createLocalPersistenceDependencies } from "./test-doubles.js";
 
 export {
@@ -122,6 +123,17 @@ export {
   type PersistenceService
 } from "./service.js";
 export {
+  PERSISTENCE_STAGE_HISTOGRAM_BUCKETS_SECONDS,
+  PERSISTENCE_STAGE_METRIC_OUTCOMES,
+  PERSISTENCE_STAGE_METRIC_SERVICE,
+  createPersistencePrometheusTelemetrySink,
+  type PersistenceHealthOutcome,
+  type PersistenceHealthProbe,
+  type PersistencePrometheusTelemetrySink,
+  type PersistenceRuntimeMetricsSink,
+  type PersistenceStageMetricOutcome
+} from "./telemetry.js";
+export {
   InMemoryPersistenceInboxStore,
   LocalBackendWorkerApiClient,
   LocalBrokerTransport,
@@ -145,15 +157,28 @@ export interface PersistenceApplication {
   readonly config: PersistenceConfig;
   start(): Promise<void>;
   stop(): Promise<void>;
+  url(path?: string): string;
 }
 
-export function createPersistenceApplication(config = loadPersistenceConfig()): PersistenceApplication {
+export interface PersistenceApplicationOptions {
+  readonly dependencies?: PersistenceDependencies;
+}
+
+export function createPersistenceApplication(
+  config = loadPersistenceConfig(),
+  options: PersistenceApplicationOptions = {}
+): PersistenceApplication {
   const identity = {
     service: config.serviceName,
     version: config.serviceVersion,
     environment: config.environment,
-    host: config.host
-  };
+    host: config.host,
+    revision: config.buildRevision,
+    deployment: config.dependencyMode === "production"
+      ? "shadow"
+      : config.environment === "test" ? "test" : "local",
+    adapter: config.dependencyMode === "production" ? "production" : "in_memory"
+  } as const;
   const logSink = config.telemetryLogs === "stdout"
     ? createJsonRuntimeTelemetrySink({
         identity,
@@ -163,22 +188,27 @@ export function createPersistenceApplication(config = loadPersistenceConfig()): 
       })
     : undefined;
   const metrics = config.metricsEnabled
-    ? createPrometheusRuntimeTelemetrySink({
-        identity
+    ? createPersistencePrometheusTelemetrySink({
+        identity,
+        expectedActive: config.dependencyMode === "production"
+          && !config.shadowMode
+          && config.security.productionWritesEnabled
       })
     : undefined;
   const telemetry = combineTelemetrySinks(logSink, metrics);
-  const dependencies = config.dependencyMode === "production"
-    ? createProductionPersistenceDependencies({
-        config,
-        clock: SYSTEM_RUNTIME_CLOCK,
-        ...(telemetry === undefined ? {} : {
-          telemetry
+  const dependencies = options.dependencies ?? (
+    config.dependencyMode === "production"
+      ? createProductionPersistenceDependencies({
+          config,
+          clock: SYSTEM_RUNTIME_CLOCK,
+          ...(telemetry === undefined ? {} : {
+            telemetry
+          })
         })
-      })
-    : createLocalPersistenceDependencies({
-        clock: SYSTEM_RUNTIME_CLOCK
-      });
+      : createLocalPersistenceDependencies({
+          clock: SYSTEM_RUNTIME_CLOCK
+        })
+  );
   const service = createPersistenceService({
     config,
     dependencies,
@@ -222,22 +252,67 @@ export function createPersistenceApplication(config = loadPersistenceConfig()): 
       telemetry
     }),
     ...(logSink === undefined ? {} : {
-      telemetryFlusher: logSink
+      telemetryFlusher: {
+        flush: async () => {
+          try {
+            await logSink.flush();
+          } catch {
+            // Telemetry flushing is best effort and must not block shutdown.
+          }
+        }
+      }
     })
   });
 
   return {
     config,
     async start(): Promise<void> {
-      assertPackageCompatibility();
-      await service.start();
-      await httpServer.listen();
-      shutdown.start();
+      let listenerBound = false;
+
+      try {
+        assertPackageCompatibility();
+        await httpServer.listen();
+        listenerBound = true;
+        shutdown.start();
+        await service.start();
+      } catch (error: unknown) {
+        shutdown.stop();
+        await cleanupFailedStart(httpServer, service, dependencies, listenerBound);
+        throw error;
+      }
     },
     async stop(): Promise<void> {
       await shutdown.trigger("manual");
+    },
+    url(path?: string): string {
+      return httpServer.url(path);
     }
   };
+}
+
+async function cleanupFailedStart(
+  httpServer: ReturnType<typeof createPersistenceHttpServer>,
+  service: ReturnType<typeof createPersistenceService>,
+  dependencies: PersistenceDependencies,
+  listenerBound: boolean
+): Promise<void> {
+  if (listenerBound) {
+    await runCleanupBestEffort(() => httpServer.close());
+  }
+
+  await runCleanupBestEffort(() => service.stop());
+
+  if (hasClose(dependencies)) {
+    await runCleanupBestEffort(() => dependencies.close());
+  }
+}
+
+async function runCleanupBestEffort(operation: () => Promise<void>): Promise<void> {
+  try {
+    await operation();
+  } catch {
+    // Preserve the startup failure while still attempting all remaining cleanup.
+  }
 }
 
 function hasClose(value: unknown): value is { close(): Promise<void> } {
@@ -275,26 +350,36 @@ function combineTelemetrySinks(
   return {
     emit: async (event) => {
       for (const sink of configured) {
-        await sink.emit(event);
+        try {
+          await sink.emit(event);
+        } catch {
+          // Each sink is isolated so one telemetry outage cannot block the others.
+        }
       }
     }
   };
 }
 
-export const SUPPORTED_RUNTIME_PACKAGE_VERSION = "0.5.0";
+export const SUPPORTED_CONTRACTS_PACKAGE_VERSION = "1.0.0";
+export const SUPPORTED_RUNTIME_PACKAGE_VERSION = "1.0.0";
 
 function assertPackageCompatibility(): void {
   const contracts = getContractPackageMetadata();
   const runtime = getRuntimePackageMetadata();
   const contractsVersion: string = contracts.packageVersion;
   const runtimeVersion: string = runtime.packageVersion;
+  const runtimeContractsVersion: string = runtime.contractsPackageVersion;
 
-  if (contractsVersion !== "0.4.0") {
+  if (contractsVersion !== SUPPORTED_CONTRACTS_PACKAGE_VERSION) {
     throw new Error(`Unsupported contracts package version ${contractsVersion}.`);
   }
 
   if (runtimeVersion !== SUPPORTED_RUNTIME_PACKAGE_VERSION) {
     throw new Error(`Unsupported runtime package version ${runtimeVersion}.`);
+  }
+
+  if (runtimeContractsVersion !== SUPPORTED_CONTRACTS_PACKAGE_VERSION) {
+    throw new Error(`Unsupported runtime contracts package version ${runtimeContractsVersion}.`);
   }
 }
 
