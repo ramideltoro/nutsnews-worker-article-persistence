@@ -2,6 +2,7 @@ import os from "node:os";
 
 export const PERSISTENCE_SERVICE_NAME = "nutsnews-worker-article-persistence" as const;
 export const PERSISTENCE_SERVICE_VERSION = "0.1.0" as const;
+export const PERSISTENCE_PRODUCTION_WRITE_CONFIRMATION = "backend-protected-persistence-cutover-approved" as const;
 
 export type PersistenceDependencyMode = "test" | "production";
 export type PersistenceTelemetryLogMode = "stdout" | "silent";
@@ -33,6 +34,7 @@ export const PERSISTENCE_CONFIG_SCHEMA = [
   variable("NUTSNEWS_PERSISTENCE_SHUTDOWN_TIMEOUT_MS", "Graceful shutdown drain timeout in milliseconds.", false, false, "30000"),
   variable("NUTSNEWS_PERSISTENCE_SHADOW_MODE", "Keep persistence output isolated from legacy ingestion.", false, false, "true"),
   variable("NUTSNEWS_PERSISTENCE_PRODUCTION_WRITES_ENABLED", "Production domain writes must remain disabled until cutover.", false, false, "false"),
+  variable("NUTSNEWS_PERSISTENCE_PRODUCTION_WRITE_CONFIRMATION", "Fixed confirmation supplied only by the protected backend cutover controller.", false, false),
   variable("NUTSNEWS_PERSISTENCE_TELEMETRY_LOGS", "Structured runtime log sink mode.", false, false, "stdout"),
   variable("NUTSNEWS_PERSISTENCE_METRICS_ENABLED", "Expose bounded Prometheus metrics.", false, false, "true")
 ] as const satisfies readonly PersistenceConfigVariable[];
@@ -62,6 +64,7 @@ export interface PersistenceConfig {
     readonly databaseRole: string;
     readonly backendApiIdentity: string;
     readonly productionWritesEnabled: boolean;
+    readonly productionWriteConfirmationValid: boolean;
   };
   readonly concurrency: number;
   readonly prefetch: number;
@@ -126,7 +129,8 @@ export function loadPersistenceConfig(env: NodeJS.ProcessEnv = process.env): Per
     security: {
       databaseRole: nonEmpty(env.NUTSNEWS_PERSISTENCE_DATABASE_ROLE, "nutsnews_worker_persistence"),
       backendApiIdentity: nonEmpty(env.NUTSNEWS_PERSISTENCE_BACKEND_API_IDENTITY, "worker-uplift-persistence"),
-      productionWritesEnabled: parseBoolean(env.NUTSNEWS_PERSISTENCE_PRODUCTION_WRITES_ENABLED, "NUTSNEWS_PERSISTENCE_PRODUCTION_WRITES_ENABLED", false, issues)
+      productionWritesEnabled: parseBoolean(env.NUTSNEWS_PERSISTENCE_PRODUCTION_WRITES_ENABLED, "NUTSNEWS_PERSISTENCE_PRODUCTION_WRITES_ENABLED", false, issues),
+      productionWriteConfirmationValid: env.NUTSNEWS_PERSISTENCE_PRODUCTION_WRITE_CONFIRMATION === PERSISTENCE_PRODUCTION_WRITE_CONFIRMATION
     },
     concurrency,
     prefetch,
@@ -145,7 +149,14 @@ export function loadPersistenceConfig(env: NodeJS.ProcessEnv = process.env): Per
   }
 
   if (config.security.productionWritesEnabled) {
-    issues.push("NUTSNEWS_PERSISTENCE_PRODUCTION_WRITES_ENABLED must remain false until backend-owned cutover.");
+    if (config.dependencyMode !== "production") {
+      issues.push("NUTSNEWS_PERSISTENCE_PRODUCTION_WRITES_ENABLED requires production dependencies.");
+    }
+    if (!config.security.productionWriteConfirmationValid) {
+      issues.push("NUTSNEWS_PERSISTENCE_PRODUCTION_WRITES_ENABLED requires the fixed protected confirmation.");
+    }
+  } else if (env.NUTSNEWS_PERSISTENCE_PRODUCTION_WRITE_CONFIRMATION !== undefined) {
+    issues.push("NUTSNEWS_PERSISTENCE_PRODUCTION_WRITE_CONFIRMATION must be absent while production writes are disabled.");
   }
 
   if (issues.length > 0) {

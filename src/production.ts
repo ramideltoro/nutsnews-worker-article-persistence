@@ -68,11 +68,14 @@ import type {
 import type {
   PersistenceBackendShadowAggregateCommand,
   PersistenceBackendShadowAggregateResult,
+  PersistenceBackendPrimaryWriteResult,
   PersistenceFinalMaterializationInputs,
   PersistenceFinalMaterializationRecord,
   PersistenceFinalMaterializationRequest,
   PersistenceFinalMaterializationWriteResult,
-  PersistenceQuarantineRecord
+  PersistenceQuarantineRecord,
+  PersistenceSaveAcceptedArticleCommand,
+  PersistenceSaveArticleSummariesCommand
 } from "./materialization-types.js";
 
 const PERSISTENCE_SCHEMA = "worker_uplift_persistence";
@@ -119,12 +122,25 @@ interface ApprovalProjectionRow extends QueryResultRow {
   readonly article_identity_hash: string;
   readonly approval_version: number;
   readonly decision: string;
+  readonly canonical_url: string | null;
+  readonly title: string | null;
+  readonly description: string | null;
+  readonly image_url: string | null;
+  readonly published_at: string | Date | null;
+  readonly category: string | null;
+  readonly source_summary: string | null;
+  readonly source_language: string | null;
+  readonly ai_model: string | null;
   readonly positivity_score: string | number | null;
 }
 
 interface TranslationProjectionRow extends QueryResultRow {
   readonly article_identity_hash: string;
   readonly language_code: string;
+  readonly source_language_code: string | null;
+  readonly translated_title: string | null;
+  readonly translated_summary: string | null;
+  readonly ai_model: string | null;
   readonly translation_version: number;
   readonly summary_ref: string | null;
   readonly quality_status: string;
@@ -167,11 +183,13 @@ export function createProductionPersistenceDependencies(
   const backendApiClient = new HttpPersistenceBackendWorkerApiClient({
     baseUrl: requiredEnv(env, "NUTSNEWS_PERSISTENCE_BACKEND_API_BASE_URL"),
     token: requiredEnv(env, "NUTSNEWS_PERSISTENCE_BACKEND_API_TOKEN"),
-    expectedVersion: options.config.compatibility.backendApiVersion
+    expectedVersion: options.config.compatibility.backendApiVersion,
+    productionDomainWritesEnabled: options.config.security.productionWritesEnabled
   });
   const dependencies: Omit<ProductionPersistenceDependencies, "workHandler" | "close"> = {
     adapterMode: "production",
     stateStoreMode: "postgresql",
+    productionDomainWritesEnabled: options.config.security.productionWritesEnabled,
     clock: options.clock,
     inboxStore,
     finalShadowTransactions,
@@ -1041,7 +1059,9 @@ export class PostgresPersistenceStageViewReader implements PersistenceStageViewR
 
   private async readApproval(request: PersistenceFinalMaterializationRequest): Promise<PersistenceFinalMaterializationInputs["approval"]> {
     const result = await this.pool.query<ApprovalProjectionRow>(
-      `SELECT article_identity_hash, approval_version, decision, positivity_score
+      `SELECT article_identity_hash, approval_version, decision, positivity_score,
+              canonical_url, title, description, image_url, published_at, category,
+              source_summary, source_language, ai_model
        FROM ${VIEWS_SCHEMA}.approval_projection
        WHERE article_identity_hash = $1
          AND approval_version = $2
@@ -1058,6 +1078,21 @@ export class PostgresPersistenceStageViewReader implements PersistenceStageViewR
       articleId: request.articleId,
       articleVersion: request.articleVersion,
       decision: approvalDecision(row?.decision),
+      canonicalUrl: row?.canonical_url ?? "",
+      title: row?.title ?? "",
+      ...(row?.description === undefined || row.description === null ? {} : {
+        description: row.description
+      }),
+      ...(row?.image_url === undefined || row.image_url === null ? {} : {
+        imageUrl: row.image_url
+      }),
+      ...(row?.published_at === undefined || row.published_at === null ? {} : {
+        publishedAt: timestampFrom(row.published_at)
+      }),
+      category: row?.category ?? "",
+      sourceSummary: row?.source_summary ?? "",
+      sourceLanguage: row?.source_language ?? "",
+      model: row?.ai_model ?? "",
       ...(row?.positivity_score === undefined || row.positivity_score === null ? {} : {
         positivityScore: Number(row.positivity_score)
       }),
@@ -1067,7 +1102,8 @@ export class PostgresPersistenceStageViewReader implements PersistenceStageViewR
 
   private async readTranslations(request: PersistenceFinalMaterializationRequest): Promise<PersistenceFinalMaterializationInputs["translations"]> {
     const result = await this.pool.query<TranslationProjectionRow>(
-      `SELECT article_identity_hash, language_code, translation_version, summary_ref, quality_status
+      `SELECT article_identity_hash, language_code, translation_version, summary_ref, quality_status,
+              source_language_code, translated_title, translated_summary, ai_model
        FROM ${VIEWS_SCHEMA}.translation_coverage_projection
        WHERE article_identity_hash = $1
          AND language_code = ANY($2::text[])`,
@@ -1088,6 +1124,10 @@ export class PostgresPersistenceStageViewReader implements PersistenceStageViewR
         articleId: request.articleId,
         articleVersion: request.articleVersion,
         languageCode: reference.languageCode,
+        sourceLanguage: row?.source_language_code ?? "",
+        title: row?.translated_title ?? "",
+        summary: row?.translated_summary ?? "",
+        model: row?.ai_model ?? "",
         summaryRef: row?.summary_ref ?? reference.uri,
         qualityStatus: translationQualityStatus(row?.quality_status),
         translationVersion: row?.translation_version ?? reference.version
@@ -1797,17 +1837,20 @@ export class HttpPersistenceBackendWorkerApiClient implements PersistenceBackend
   private readonly baseUrl: string;
   private readonly token: string;
   private readonly expectedVersion: string;
+  private readonly productionDomainWritesEnabled: boolean;
   private readonly fetcher: FetchLike;
 
   constructor(options: {
     readonly baseUrl: string;
     readonly token: string;
     readonly expectedVersion: string;
+    readonly productionDomainWritesEnabled?: boolean;
     readonly fetcher?: FetchLike;
   }) {
     this.baseUrl = stripTrailingSlashes(options.baseUrl);
     this.token = options.token;
     this.expectedVersion = options.expectedVersion;
+    this.productionDomainWritesEnabled = options.productionDomainWritesEnabled ?? false;
     this.fetcher = options.fetcher ?? fetch;
   }
 
@@ -1845,9 +1888,11 @@ export class HttpPersistenceBackendWorkerApiClient implements PersistenceBackend
       version,
       requiredScopes: [
         "worker-uplift-persistence",
-        "uplift-record-shadow-aggregate"
+        "uplift-record-shadow-aggregate",
+        "uplift-save-accepted-articles-batch",
+        "uplift-save-article-summaries-batch"
       ],
-      productionDomainWritesEnabled: false
+      productionDomainWritesEnabled: this.productionDomainWritesEnabled
     };
   }
 
@@ -1886,6 +1931,58 @@ export class HttpPersistenceBackendWorkerApiClient implements PersistenceBackend
       throw new PersistencePermanentError("backend-api-unauthorized", error);
     }
 
+    throw new PersistenceTransientError("backend-api-transient", error);
+  }
+
+  async saveAcceptedArticle(
+    command: PersistenceSaveAcceptedArticleCommand
+  ): Promise<PersistenceBackendPrimaryWriteResult> {
+    return this.writeExactPrimaryCommand(command, 1, "articleCount");
+  }
+
+  async saveArticleSummaries(
+    command: PersistenceSaveArticleSummariesCommand
+  ): Promise<PersistenceBackendPrimaryWriteResult> {
+    return this.writeExactPrimaryCommand(command, command.summaries.length, "summaryCount");
+  }
+
+  private async writeExactPrimaryCommand(
+    command: PersistenceSaveAcceptedArticleCommand | PersistenceSaveArticleSummariesCommand,
+    expectedCount: number,
+    countField: "articleCount" | "summaryCount"
+  ): Promise<PersistenceBackendPrimaryWriteResult> {
+    if (!this.productionDomainWritesEnabled) {
+      throw new PersistencePermanentError("backend-api-production-writes-disabled");
+    }
+    const response = await this.fetcher(`${this.baseUrl}/${command.operation}`, {
+      method: "POST",
+      headers: {
+        "authorization": `Bearer ${this.token}`,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify(command),
+      signal: AbortSignal.timeout(10_000)
+    });
+    const body = await parseJsonResponse(response);
+
+    if (response.ok) {
+      const affectedCount = integerFrom(body[countField], -1);
+
+      if (!booleanValue(body.ok) || affectedCount !== expectedCount) {
+        throw new PersistencePermanentError("backend-api-production-write-unconfirmed");
+      }
+      return {
+        status: booleanValue(body.duplicate) ? "duplicate" : "recorded",
+        affectedCount,
+        response: body
+      };
+    }
+
+    const error = stringFrom(body.error, response.statusText);
+
+    if (response.status === 401 || response.status === 403 || response.status === 409) {
+      throw new PersistencePermanentError("backend-api-production-write-rejected", error);
+    }
     throw new PersistenceTransientError("backend-api-transient", error);
   }
 }
@@ -2103,6 +2200,10 @@ function stringFrom(value: unknown, fallback: string): string {
   return typeof value === "string" && value.length > 0 ? value : fallback;
 }
 
+function timestampFrom(value: string | Date): string {
+  return value instanceof Date ? value.toISOString() : value;
+}
+
 function positiveInteger(value: unknown): number | undefined {
   if (typeof value === "number" && Number.isInteger(value) && value > 0) {
     return value;
@@ -2113,6 +2214,10 @@ function positiveInteger(value: unknown): number | undefined {
   }
 
   return undefined;
+}
+
+function integerFrom(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isInteger(value) ? value : fallback;
 }
 
 function booleanValue(value: unknown): boolean {

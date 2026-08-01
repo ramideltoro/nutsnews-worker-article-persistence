@@ -16,11 +16,14 @@ import type {
 import type {
   PersistenceBackendShadowAggregateCommand,
   PersistenceBackendShadowAggregateResult,
+  PersistenceBackendPrimaryWriteResult,
   PersistenceFinalMaterializationInputs,
   PersistenceFinalMaterializationRecord,
   PersistenceFinalMaterializationRequest,
   PersistenceFinalMaterializationWriteResult,
-  PersistenceQuarantineRecord
+  PersistenceQuarantineRecord,
+  PersistenceSaveAcceptedArticleCommand,
+  PersistenceSaveArticleSummariesCommand
 } from "./materialization-types.js";
 
 export interface PersistenceDependencyProbe {
@@ -111,7 +114,7 @@ export interface PersistenceBackendApiCompatibility {
   readonly summary: string;
   readonly version: string;
   readonly requiredScopes: readonly string[];
-  readonly productionDomainWritesEnabled: false;
+  readonly productionDomainWritesEnabled: boolean;
 }
 
 export interface PersistenceBackendWorkerApiClient {
@@ -121,6 +124,12 @@ export interface PersistenceBackendWorkerApiClient {
   recordShadowAggregate(
     command: PersistenceBackendShadowAggregateCommand
   ): PersistenceBackendShadowAggregateResult | Promise<PersistenceBackendShadowAggregateResult>;
+  saveAcceptedArticle(
+    command: PersistenceSaveAcceptedArticleCommand
+  ): PersistenceBackendPrimaryWriteResult | Promise<PersistenceBackendPrimaryWriteResult>;
+  saveArticleSummaries(
+    command: PersistenceSaveArticleSummariesCommand
+  ): PersistenceBackendPrimaryWriteResult | Promise<PersistenceBackendPrimaryWriteResult>;
 }
 
 export interface PersistenceWorkTools {
@@ -145,6 +154,7 @@ export interface PersistenceBrokerTransport extends RuntimeBrokerTransport {
 export interface PersistenceDependencies {
   readonly adapterMode: "in_memory" | "production";
   readonly stateStoreMode: "in_memory" | "postgresql";
+  readonly productionDomainWritesEnabled: boolean;
   readonly clock: RuntimeClock;
   readonly inboxStore: PersistenceInboxStore;
   readonly finalShadowTransactions: PersistenceFinalShadowTransactionRunner;

@@ -191,7 +191,6 @@ export function createPersistenceApplication(
     ? createPersistencePrometheusTelemetrySink({
         identity,
         expectedActive: config.dependencyMode === "production"
-          && !config.shadowMode
           && config.security.productionWritesEnabled
       })
     : undefined;

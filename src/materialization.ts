@@ -22,6 +22,7 @@ import type {
 import { sha256Digest } from "./digest.js";
 import type {
   PersistenceBackendShadowAggregateCommand,
+  PersistenceProductionMaterialization,
   PersistenceFinalMaterializationAudit,
   PersistenceFinalMaterializationInputs,
   PersistenceFinalMaterializationRecord,
@@ -29,6 +30,8 @@ import type {
   PersistenceFinalShadowAggregate,
   PersistenceQuarantineRecord,
   PersistenceStageResultReference,
+  PersistenceSaveAcceptedArticleCommand,
+  PersistenceSaveArticleSummariesCommand,
   PersistenceTranslationStageResultReference
 } from "./materialization-types.js";
 
@@ -91,6 +94,9 @@ export class FinalShadowMaterializationHandler implements PersistenceWorkHandler
     }
 
     const aggregate = buildFinalShadowAggregate(request, inputs);
+    const productionMaterialization = this.dependencies.productionDomainWritesEnabled && aggregate.publicationStatus === "ready"
+      ? buildProductionMaterialization(request, inputs)
+      : undefined;
     const backendCommand = buildBackendShadowAggregateCommand(request, aggregate);
     const publicationReadinessCommand = buildPublicationReadinessCommand(context, request, inputs, aggregate);
     const audit = buildAuditRecord(request, inputs, aggregate, "recorded_success");
@@ -149,6 +155,7 @@ export class FinalShadowMaterializationHandler implements PersistenceWorkHandler
     });
 
     if (writeResult.status === "recorded") {
+      await this.applyProductionMaterializationIfEnabled(tools, productionMaterialization);
       await this.publishUnconfirmedReadiness(tools, writeResult.publicationReadinessCommand);
       return {
         status: "ok"
@@ -156,6 +163,7 @@ export class FinalShadowMaterializationHandler implements PersistenceWorkHandler
     }
 
     if (writeResult.status === "duplicate") {
+      await this.applyProductionMaterializationIfEnabled(tools, productionMaterialization);
       await this.publishUnconfirmedReadiness(tools, writeResult.publicationReadinessCommand);
       return {
         status: "ok"
@@ -166,6 +174,23 @@ export class FinalShadowMaterializationHandler implements PersistenceWorkHandler
       status: "terminal-failure",
       reason: writeResult.reason
     };
+  }
+
+  private async applyProductionMaterializationIfEnabled(
+    tools: PersistenceWorkTools,
+    materialization: PersistenceProductionMaterialization | undefined
+  ): Promise<void> {
+    if (!this.dependencies.productionDomainWritesEnabled || materialization === undefined) {
+      return;
+    }
+    await runPersistenceWorkOperation(
+      tools,
+      () => this.dependencies.backendApiClient.saveAcceptedArticle(materialization.saveArticleCommand)
+    );
+    await runPersistenceWorkOperation(
+      tools,
+      () => this.dependencies.backendApiClient.saveArticleSummaries(materialization.saveSummariesCommand)
+    );
   }
 
   private async recordQuarantine(
@@ -511,6 +536,25 @@ function validateStageInputs(
 
   const seenLanguages = new Set<string>();
 
+  if (
+    inputs.approval.decision === "approved"
+    && (!isHttpUrl(inputs.approval.canonicalUrl)
+      || inputs.approval.title.trim().length === 0
+      || !isHttpUrl(inputs.approval.imageUrl ?? "")
+      || inputs.approval.category.trim().length === 0
+      || inputs.approval.sourceSummary.trim().length === 0
+      || inputs.approval.sourceLanguage.trim().length === 0
+      || inputs.approval.model.trim().length === 0)
+  ) {
+    return {
+      reason: "incomplete-approved-publication-material",
+      diagnosticMetadata: {
+        safeMetadataOnly: true,
+        articleVersion: request.articleVersion
+      }
+    };
+  }
+
   for (const translationRef of request.stageRefs.translations) {
     const result = inputs.translations.find((candidate) => candidate.languageCode === translationRef.languageCode);
 
@@ -528,7 +572,106 @@ function validateStageInputs(
     seenLanguages.add(translationRef.languageCode);
   }
 
+  if (inputs.translations.some((translation) => (
+    translation.qualityStatus === "accepted"
+    && (translation.title.trim().length === 0
+      || translation.summary.trim().length === 0
+      || translation.sourceLanguage.trim().length === 0
+      || translation.model.trim().length === 0)
+  ))) {
+    return {
+      reason: "incomplete-translated-publication-material",
+      diagnosticMetadata: {
+        safeMetadataOnly: true,
+        translationResultCount: inputs.translations.length
+      }
+    };
+  }
+
   return undefined;
+}
+
+function buildProductionMaterialization(
+  request: PersistenceFinalMaterializationRequest,
+  inputs: PersistenceFinalMaterializationInputs
+): PersistenceProductionMaterialization {
+  if (!sameStringSet(request.requiredLanguageCodes, DEFAULT_REQUIRED_LANGUAGE_CODES)) {
+    throw new Error("production materialization requires the exact five-language policy");
+  }
+  const occurredAt = new Date(request.producedAt).toISOString();
+  const article = {
+    source: sourceName(inputs.approval.canonicalUrl),
+    title: inputs.approval.title,
+    original_url: inputs.approval.canonicalUrl,
+    ...(inputs.approval.imageUrl === undefined ? {} : {
+      image_url: inputs.approval.imageUrl
+    }),
+    ...(inputs.approval.publishedAt === undefined ? {} : {
+      published_at: inputs.approval.publishedAt
+    }),
+    published_on_site_at: occurredAt,
+    ...(inputs.approval.description === undefined ? {} : {
+      original_excerpt: inputs.approval.description
+    }),
+    ai_summary: inputs.approval.sourceSummary,
+    category: inputs.approval.category,
+    ...(inputs.approval.positivityScore === undefined ? {} : {
+      positivity_score: inputs.approval.positivityScore
+    }),
+    ai_provider: "local_ai",
+    ai_model: inputs.approval.model,
+    status: "translation_pending"
+  } as const;
+  const summaries = request.requiredLanguageCodes.map((languageCode) => {
+    const result = inputs.translations.find((translation) => (
+      translation.languageCode === languageCode && translation.qualityStatus === "accepted"
+    ));
+
+    if (result === undefined) {
+      throw new Error(`missing accepted translation material for ${languageCode}`);
+    }
+    return {
+      original_url: inputs.approval.canonicalUrl,
+      language_code: result.languageCode,
+      source_language_code: result.sourceLanguage,
+      title: result.title,
+      summary: result.summary,
+      generated_by: "local_ai",
+      model: result.model,
+      updated_at: occurredAt
+    } as const;
+  });
+  const baseCommand = {
+    providerMode: "backend_postgres_primary",
+    messageId: request.messageId,
+    correlationId: request.correlationId,
+    pipelineRunId: request.pipelineRunId,
+    stageExecutionId: request.stageExecutionId,
+    sourceMessageId: request.sourceMessageId,
+    actorService: "worker-uplift-persistence",
+    schemaVersion: 1,
+    operationVersion: request.articleVersion,
+    expectedArticleVersion: request.articleVersion
+  } as const;
+  const saveArticleCommand: PersistenceSaveAcceptedArticleCommand = {
+    ...baseCommand,
+    operation: "uplift-save-accepted-articles-batch",
+    idempotencyKey: `${request.idempotencyKey}:accepted-article`,
+    articles: [article]
+  };
+  const saveSummariesCommand: PersistenceSaveArticleSummariesCommand = {
+    ...baseCommand,
+    operation: "uplift-save-article-summaries-batch",
+    idempotencyKey: `${request.idempotencyKey}:article-summaries`,
+    summaries
+  };
+
+  return {
+    article,
+    summaries,
+    saveArticleCommand,
+    saveSummariesCommand
+  };
 }
 
 function buildFinalShadowAggregate(
@@ -643,7 +786,7 @@ function buildPublicationReadinessCommand(
     .map((translation) => translation.languageCode));
   const missingLanguageCodes = request.requiredLanguageCodes.filter((languageCode) => !availableLanguageCodes.includes(languageCode));
   const readinessStatus = aggregate.publicationStatus === "ready" ? "ready" : "blocked_missing_translations";
-  const sourceSummary = inputs.translations.find((translation) => translation.qualityStatus === "accepted");
+  const sourceSummary = inputs.approval.sourceSummary.trim().length > 0 ? inputs.approval.sourceSummary : undefined;
   const payload = {
     schemaId: STAGE_PAYLOAD_SCHEMA_IDS.publicationReadiness,
     schemaVersion: STAGE_PAYLOAD_SCHEMA_VERSION,
@@ -677,12 +820,12 @@ function buildPublicationReadinessCommand(
       ...(sourceSummary === undefined ? {} : {
         persistedSourceSummaryRef: {
           kind: "backend-record",
-          uri: sourceSummary.summaryRef,
+          uri: request.stageRefs.approval.uri,
           mediaType: "application/json"
         }
       }),
       processingState: "clear",
-      originalUrl: `shadow://article/${aggregate.articleIdentityHash}`,
+      originalUrl: inputs.approval.canonicalUrl,
       operationVersion: "public-feed-snapshot-compat-v1",
       publicFeedSnapshotRequest: {
         limit: 6,
@@ -692,14 +835,14 @@ function buildPublicationReadinessCommand(
       },
       publicFeedSnapshot: {
         id: request.articleId,
-        source: "worker-uplift-shadow",
-        title: "Sanitized public-feed compatibility title",
-        originalUrl: `shadow://article/${aggregate.articleIdentityHash}`,
-        imageUrl: "https://example.invalid/public-feed/article.jpg",
-        publishedAt: occurredAt,
+        source: sourceName(inputs.approval.canonicalUrl),
+        title: inputs.approval.title,
+        originalUrl: inputs.approval.canonicalUrl,
+        imageUrl: inputs.approval.imageUrl ?? "",
+        publishedAt: inputs.approval.publishedAt ?? occurredAt,
         publishedOnSiteAt: occurredAt,
-        aiSummary: "Sanitized public-feed compatibility summary.",
-        category: aggregate.category ?? "world",
+        aiSummary: inputs.approval.sourceSummary,
+        category: inputs.approval.category,
         positivityScore: aggregate.positivityScore ?? 0,
         status: "published",
         snapshotRank: 1
@@ -708,8 +851,8 @@ function buildPublicationReadinessCommand(
         .filter((translation) => translation.qualityStatus === "accepted")
         .map((translation) => ({
           languageCode: translation.languageCode,
-          title: "Sanitized localized public-feed title",
-          summary: "Sanitized localized public-feed summary."
+          title: translation.title,
+          summary: translation.summary
         }))
     }
   };
@@ -886,6 +1029,30 @@ function hasForbiddenStageBodyFields(value: JsonRecord): boolean {
 
 function uniqueStrings(values: readonly string[]): readonly string[] {
   return Array.from(new Set(values));
+}
+
+function sameStringSet(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value) => right.includes(value));
+}
+
+function isHttpUrl(value: string): boolean {
+  try {
+    const parsed = new URL(value);
+
+    return (parsed.protocol === "http:" || parsed.protocol === "https:") && parsed.hostname.length > 0;
+  } catch {
+    return false;
+  }
+}
+
+function sourceName(value: string): string {
+  try {
+    const hostname = new URL(value).hostname.replace(/^www\./u, "");
+
+    return hostname.length > 0 ? hostname : "NutsNews";
+  } catch {
+    return "NutsNews";
+  }
 }
 
 function deterministicUuid(seed: string): string {

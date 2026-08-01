@@ -64,6 +64,15 @@ export interface PersistenceApprovalStageResult {
   readonly articleId: string;
   readonly articleVersion: number;
   readonly decision: "approved" | "rejected" | "needs_review";
+  readonly canonicalUrl: string;
+  readonly title: string;
+  readonly description?: string;
+  readonly imageUrl?: string;
+  readonly publishedAt?: string;
+  readonly category: string;
+  readonly sourceSummary: string;
+  readonly sourceLanguage: string;
+  readonly model: string;
   readonly positivityScore?: number;
   readonly approvalVersion: number;
 }
@@ -72,6 +81,10 @@ export interface PersistenceTranslationStageResult {
   readonly articleId: string;
   readonly articleVersion: number;
   readonly languageCode: string;
+  readonly sourceLanguage: string;
+  readonly title: string;
+  readonly summary: string;
+  readonly model: string;
   readonly summaryRef: string;
   readonly qualityStatus: "accepted" | "failed" | "needs_review" | "pending";
   readonly translationVersion: number;
@@ -187,3 +200,67 @@ export type PersistenceBackendShadowAggregateResult =
       readonly status: "conflict" | "stale";
       readonly reason: string;
     };
+
+export interface PersistenceAcceptedArticleRow {
+  readonly source: string;
+  readonly title: string;
+  readonly original_url: string;
+  readonly image_url?: string;
+  readonly published_at?: string;
+  readonly published_on_site_at: string;
+  readonly original_excerpt?: string;
+  readonly ai_summary: string;
+  readonly category: string;
+  readonly positivity_score?: number;
+  readonly ai_provider: "local_ai";
+  readonly ai_model: string;
+  readonly status: "translation_pending";
+}
+
+export interface PersistenceArticleSummaryRow {
+  readonly original_url: string;
+  readonly language_code: string;
+  readonly source_language_code: string;
+  readonly title: string;
+  readonly summary: string;
+  readonly generated_by: "local_ai";
+  readonly model: string;
+  readonly updated_at: string;
+}
+
+interface PersistenceBackendPrimaryCommandBase {
+  readonly providerMode: "backend_postgres_primary";
+  readonly idempotencyKey: string;
+  readonly messageId: string;
+  readonly correlationId: string;
+  readonly pipelineRunId: string;
+  readonly stageExecutionId: string;
+  readonly sourceMessageId: string;
+  readonly actorService: "worker-uplift-persistence";
+  readonly schemaVersion: 1;
+  readonly operationVersion: number;
+  readonly expectedArticleVersion: number;
+}
+
+export interface PersistenceSaveAcceptedArticleCommand extends PersistenceBackendPrimaryCommandBase {
+  readonly operation: "uplift-save-accepted-articles-batch";
+  readonly articles: readonly [PersistenceAcceptedArticleRow];
+}
+
+export interface PersistenceSaveArticleSummariesCommand extends PersistenceBackendPrimaryCommandBase {
+  readonly operation: "uplift-save-article-summaries-batch";
+  readonly summaries: readonly PersistenceArticleSummaryRow[];
+}
+
+export interface PersistenceProductionMaterialization {
+  readonly article: PersistenceAcceptedArticleRow;
+  readonly summaries: readonly PersistenceArticleSummaryRow[];
+  readonly saveArticleCommand: PersistenceSaveAcceptedArticleCommand;
+  readonly saveSummariesCommand: PersistenceSaveArticleSummariesCommand;
+}
+
+export interface PersistenceBackendPrimaryWriteResult {
+  readonly status: "recorded" | "duplicate";
+  readonly affectedCount: number;
+  readonly response: Readonly<Record<string, unknown>>;
+}

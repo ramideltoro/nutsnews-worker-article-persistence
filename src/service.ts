@@ -173,7 +173,7 @@ export function createPersistenceService(options: PersistenceServiceOptions): Pe
           stageViewPermissionCheck(options),
           backendApiCompatibilityCheck(options),
           shadowModeCheck(options.config),
-          productionWritesDisabledCheck(options.config)
+          productionWritePolicyCheck(options.config)
         ],
         clock: options.dependencies.clock,
         ...(telemetry === undefined ? {} : {
@@ -1068,16 +1068,19 @@ function shadowModeCheck(config: PersistenceConfig): RuntimeHealthCheck {
   };
 }
 
-function productionWritesDisabledCheck(config: PersistenceConfig): RuntimeHealthCheck {
+function productionWritePolicyCheck(config: PersistenceConfig): RuntimeHealthCheck {
   return {
-    name: "production-writes-disabled",
+    name: "production-write-policy",
     critical: true,
-    check: () => !config.security.productionWritesEnabled
+    check: () => !config.security.productionWritesEnabled || (
+      config.dependencyMode === "production"
+      && config.security.productionWriteConfirmationValid
+    )
       ? "ok"
       : {
           status: "unhealthy",
           details: {
-            reason: "production-writes-enabled"
+            reason: "production-write-policy-invalid"
           }
         }
   };

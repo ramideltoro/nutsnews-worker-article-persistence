@@ -26,6 +26,75 @@ import {
 } from "../src/test-doubles.js";
 
 describe("persistence transaction, replay, and DLQ safety", () => {
+  it("materializes exactly one accepted article and five localized summaries before publication when protected writes are active", async () => {
+    const context = createSafetyContext(true);
+    const base = createMinimalPersistenceDelivery();
+    const basePayload = base.payload as Readonly<Record<string, unknown>>;
+    const existingTranslations = context.stageViews.materializationInputs.translations;
+    const addedTranslations = [
+      translatedMaterial("de-CH", "Eine kostenlose Quartierbibliothek", "Nachbarn bauten eine kostenlose Bibliothek für Familien im Quartier."),
+      translatedMaterial("de", "Eine kostenlose Nachbarschaftsbibliothek", "Nachbarn schufen eine kostenlose Bibliothek für Familien in der Umgebung."),
+      translatedMaterial("el", "Μια δωρεάν κοινοτική βιβλιοθήκη", "Οι κάτοικοι δημιούργησαν μια δωρεάν βιβλιοθήκη για τις οικογένειες της περιοχής.")
+    ];
+    context.stageViews.materializationInputs = {
+      ...context.stageViews.materializationInputs,
+      translations: [...existingTranslations, ...addedTranslations]
+    };
+    const entityRef = (basePayload.entityRefs as readonly Readonly<Record<string, unknown>>[])[0];
+    const stageRefs = entityRef?.stageResultRefs as Readonly<Record<string, unknown>>;
+    const translationRefs = stageRefs.translations as readonly Readonly<Record<string, unknown>>[];
+    const delivery = {
+      ...base,
+      payload: {
+        ...basePayload,
+        entityRefs: [{
+          ...entityRef,
+          requiredLanguageCodes: ["fr", "ja", "de-CH", "de", "el"],
+          stageResultRefs: {
+            ...stageRefs,
+            translations: [
+              ...translationRefs,
+              ...addedTranslations.map((translation) => ({
+                languageCode: translation.languageCode,
+                uri: translation.summaryRef,
+                version: 1,
+                digest: `sha256:translation-${translation.languageCode}`
+              }))
+            ]
+          }
+        }]
+      }
+    };
+
+    await context.service.start();
+    await expect(context.broker.deliverPersistence(delivery)).resolves.toMatchObject({
+      action: "ack",
+      reason: "handled"
+    });
+
+    expect(context.backendApi.acceptedArticleCommands).toHaveLength(1);
+    expect(context.backendApi.acceptedArticleCommands[0]?.articles).toEqual([
+      expect.objectContaining({
+        original_url: "https://publisher.example.test/community/article-001",
+        status: "translation_pending"
+      })
+    ]);
+    expect(context.backendApi.articleSummaryCommands).toHaveLength(1);
+    expect(context.backendApi.articleSummaryCommands[0]?.summaries.map((row) => row.language_code)).toEqual([
+      "fr",
+      "ja",
+      "de-CH",
+      "de",
+      "el"
+    ]);
+    expect(context.broker.published[0]?.payload).toMatchObject({
+      publicationRef: {
+        originalUrl: "https://publisher.example.test/community/article-001"
+      }
+    });
+    await context.service.stop();
+  });
+
   it("recovers when broker publish fails after final-shadow commit but before ack", async () => {
     const context = createSafetyContext();
 
@@ -231,12 +300,14 @@ describe("persistence transaction, replay, and DLQ safety", () => {
   });
 });
 
-function createSafetyContext() {
+function createSafetyContext(productionDomainWritesEnabled = false) {
   const config = loadPersistenceConfig({
     NUTSNEWS_PERSISTENCE_HTTP_PORT: "0",
     NUTSNEWS_PERSISTENCE_TELEMETRY_LOGS: "silent"
   });
-  const dependencies = createLocalPersistenceDependencies();
+  const dependencies = createLocalPersistenceDependencies({
+    productionDomainWritesEnabled
+  });
   const telemetry = createBufferedRuntimeTelemetrySink(500);
   const metrics = createPersistencePrometheusTelemetrySink({
     identity: {
@@ -268,5 +339,20 @@ function createSafetyContext() {
     service,
     stageViews: dependencies.stageViewReader as LocalStageViewReader,
     telemetry
+  };
+}
+
+function translatedMaterial(languageCode: string, title: string, summary: string) {
+  return {
+    articleId: "article-001",
+    articleVersion: 1,
+    languageCode,
+    sourceLanguage: "en",
+    title,
+    summary,
+    model: "qwen2.5:3b",
+    summaryRef: `backend://worker-uplift/translation/article-001/${languageCode}/v1`,
+    qualityStatus: "accepted" as const,
+    translationVersion: 1
   };
 }
