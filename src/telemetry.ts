@@ -9,7 +9,9 @@ import {
 
 export const PERSISTENCE_STAGE_METRIC_SERVICE = "persistence" as const;
 export const PERSISTENCE_STAGE_HISTOGRAM_BUCKETS_SECONDS = [
+  0.005,
   0.01,
+  0.025,
   0.05,
   0.1,
   0.25,
@@ -54,7 +56,7 @@ export interface PersistenceRuntimeMetricsSink extends RuntimeTelemetrySink {
 
 export interface PersistencePrometheusTelemetrySink extends PersistenceRuntimeMetricsSink {
   readonly allowedLabels: PrometheusRuntimeTelemetrySink["allowedLabels"];
-  setHealthProbe(probe: PersistenceHealthProbe, outcome: PersistenceHealthOutcome): void;
+  setHealthProbe(probe: PersistenceHealthProbe, outcome: PersistenceHealthOutcome, check?: string): void;
 }
 
 interface PersistenceStageHistogram {
@@ -75,11 +77,39 @@ const HEALTH_OUTCOMES = [
   "degraded",
   "unhealthy"
 ] as const satisfies readonly PersistenceHealthOutcome[];
+const PERSISTENCE_RUNTIME_DEPENDENCIES = [
+  "persistence-routing-work-handler",
+  "feed-health-projection-handler",
+  "local-persistence-work-handler"
+] as const;
+const PERSISTENCE_RUNTIME_HEALTH_CHECKS = [
+  "process",
+  "service-started",
+  "broker-lifecycle",
+  "rabbitmq-consumer",
+  "persistence-inbox",
+  "final-shadow-transactions",
+  "stage-view-reader",
+  "broker-outbox",
+  "feed-health-projection-store",
+  "backend-worker-api",
+  "final-shadow-permissions",
+  "stage-view-permissions",
+  "backend-api-compatibility",
+  "shadow-mode",
+  "production-writes-disabled"
+] as const;
 
 export function createPersistencePrometheusTelemetrySink(
   options: PersistencePrometheusTelemetrySinkOptions
 ): PersistencePrometheusTelemetrySink {
-  const runtimeSink = createPrometheusRuntimeTelemetrySink(options);
+  const runtimeSink = createPrometheusRuntimeTelemetrySink({
+    ...options,
+    cardinality: {
+      dependencies: options.cardinality?.dependencies ?? PERSISTENCE_RUNTIME_DEPENDENCIES,
+      healthChecks: options.cardinality?.healthChecks ?? PERSISTENCE_RUNTIME_HEALTH_CHECKS
+    }
+  });
   const eventCounts = new Map<PersistenceStageMetricOutcome, number>();
   const health = new Map<PersistenceHealthProbe, PersistenceHealthOutcome>([
     [
@@ -100,6 +130,11 @@ export function createPersistencePrometheusTelemetrySink(
     count: 0,
     sum: 0
   };
+  let lastSuccessTimestampSeconds: number | undefined;
+
+  for (const [probe, outcome] of health) {
+    setRuntimeHealthProbe(runtimeSink, probe, outcome);
+  }
 
   return {
     allowedLabels: runtimeSink.allowedLabels,
@@ -116,7 +151,12 @@ export function createPersistencePrometheusTelemetrySink(
       }
 
       observeHealthEvent(health, event);
-      observeConsumerReadinessEvent(health, event);
+      observeConsumerReadinessEvent(health, event, runtimeSink);
+      lastSuccessTimestampSeconds = updateRuntimeLastSuccess(
+        runtimeSink,
+        event,
+        lastSuccessTimestampSeconds
+      );
 
       if (shouldForwardToRuntime(event)) {
         try {
@@ -130,13 +170,11 @@ export function createPersistencePrometheusTelemetrySink(
       const runtimeMetrics = collectRuntimeMetrics(runtimeSink);
       const identityMetrics = collectCompatibilityIdentityMetrics(options, runtimeMetrics);
       const stageMetrics = collectStageMetrics(options, eventCounts, histogram);
-      const ownershipMetrics = collectExpectedActiveMetric(options);
-      const healthMetrics = collectHealthMetrics(options, health);
+      const healthMetrics = collectHealthMetrics(options, health, runtimeMetrics);
 
       return [
         runtimeMetrics,
         identityMetrics,
-        ownershipMetrics,
         healthMetrics,
         stageMetrics
       ].filter((value) => value.length > 0).join("\n").concat("\n");
@@ -147,8 +185,9 @@ export function createPersistencePrometheusTelemetrySink(
     setShutdownDraining(draining): void {
       runBestEffort(() => runtimeSink.setShutdownDraining(draining));
     },
-    setHealthProbe(probe, outcome): void {
+    setHealthProbe(probe, outcome, check): void {
       health.set(probe, outcome);
+      setRuntimeHealthProbe(runtimeSink, probe, outcome, check);
     }
   };
 }
@@ -196,10 +235,6 @@ function collectRuntimeMetrics(runtimeSink: PersistenceRuntimeMetricsSink): stri
 }
 
 function shouldForwardToRuntime(event: RuntimeTelemetryEvent): boolean {
-  if (event.name === "runtime.health.evaluated") {
-    return false;
-  }
-
   if (event.name !== "runtime.dependency.observed") {
     return true;
   }
@@ -226,16 +261,6 @@ function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
   return typeof value === "object" && value !== null && "then" in value && typeof value.then === "function";
 }
 
-function collectExpectedActiveMetric(options: PrometheusRuntimeTelemetrySinkOptions): string {
-  const environment = metricLabelValue(options.identity.environment);
-
-  return [
-    "# HELP nutsnews_worker_expected_active Whether this worker deployment is expected to own active production work.",
-    "# TYPE nutsnews_worker_expected_active gauge",
-    `nutsnews_worker_expected_active${stageHistogramBaseLabels(environment, PERSISTENCE_STAGE_METRIC_SERVICE)} 0`
-  ].join("\n");
-}
-
 function observeHealthEvent(
   health: Map<PersistenceHealthProbe, PersistenceHealthOutcome>,
   event: RuntimeTelemetryEvent
@@ -254,7 +279,8 @@ function observeHealthEvent(
 
 function observeConsumerReadinessEvent(
   health: Map<PersistenceHealthProbe, PersistenceHealthOutcome>,
-  event: RuntimeTelemetryEvent
+  event: RuntimeTelemetryEvent,
+  runtimeSink: PrometheusRuntimeTelemetrySink
 ): void {
   if (
     event.name !== "runtime.broker.consumer_state_changed"
@@ -271,13 +297,19 @@ function observeConsumerReadinessEvent(
 
   if (consumerCount === 0) {
     health.set("readiness", "unhealthy");
+    setRuntimeHealthProbe(runtimeSink, "readiness", "unhealthy", "rabbitmq-consumer");
   }
 }
 
 function collectHealthMetrics(
   options: PrometheusRuntimeTelemetrySinkOptions,
-  health: ReadonlyMap<PersistenceHealthProbe, PersistenceHealthOutcome>
+  health: ReadonlyMap<PersistenceHealthProbe, PersistenceHealthOutcome>,
+  runtimeOutput: string
 ): string {
+  if (hasMetricFamily(runtimeOutput, "nutsnews_worker_health_probe")) {
+    return "";
+  }
+
   const environment = metricLabelValue(options.identity.environment);
   const lines = [
     "# HELP nutsnews_worker_health_probe Worker liveness, startup, and readiness state by bounded probe and outcome.",
@@ -297,6 +329,58 @@ function collectHealthMetrics(
   }
 
   return lines.join("\n");
+}
+
+function setRuntimeHealthProbe(
+  runtimeSink: PrometheusRuntimeTelemetrySink,
+  probe: PersistenceHealthProbe,
+  outcome: PersistenceHealthOutcome,
+  check?: string
+): void {
+  const checks = check === undefined
+    ? []
+    : [
+        {
+          name: check,
+          status: outcome,
+          critical: true,
+          durationMs: 0
+        }
+      ];
+
+  runBestEffort(() => runtimeSink.emit({
+    name: "runtime.health.evaluated",
+    level: outcome === "ok" ? "info" : "warn",
+    at: new Date().toISOString(),
+    outcome,
+    attributes: {
+      probe,
+      status: outcome,
+      checkCount: checks.length,
+      checks
+    }
+  }));
+}
+
+function updateRuntimeLastSuccess(
+  runtimeSink: PrometheusRuntimeTelemetrySink,
+  event: RuntimeTelemetryEvent,
+  current: number | undefined
+): number | undefined {
+  if (event.name !== "runtime.message.accepted" && event.name !== "runtime.message.duplicate") {
+    return current;
+  }
+
+  const parsedTimestampSeconds = Math.floor(Date.parse(event.at) / 1_000);
+
+  if (!Number.isFinite(parsedTimestampSeconds) || parsedTimestampSeconds < 0) {
+    return current;
+  }
+
+  const next = Math.max(current ?? 0, parsedTimestampSeconds);
+  runBestEffort(() => runtimeSink.setLastSuccessTimestamp(next));
+
+  return next;
 }
 
 function healthLabels(

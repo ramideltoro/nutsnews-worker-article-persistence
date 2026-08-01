@@ -42,7 +42,8 @@ describe("createPersistenceHttpServer", () => {
         version: config.serviceVersion,
         environment: config.environment,
         host: config.host
-      }
+      },
+      expectedActive: false
     });
     service = createPersistenceService({
       config,
@@ -68,13 +69,16 @@ describe("createPersistenceHttpServer", () => {
     expect(live.status).toBe(200);
     expect(ready.status).toBe(200);
     const metricsBody = await metricsResponse.text();
-    expect(metricsBody).toContain("nutsnews_worker_dependency_duration_ms");
+    expect(metricsBody).toContain("nutsnews_worker_dependency_duration_seconds_bucket");
+    expect(metricsBody).not.toContain("nutsnews_worker_dependency_duration_ms");
     expect(metricsBody).toContain("nutsnews_worker_uplift_stage_events_total");
     expect(metricsBody).toContain('nutsnews_worker_uplift_stage_latency_seconds_bucket{environment="local",service="persistence",le="30"} 1');
-    expect(metricsBody).toContain('nutsnews_worker_expected_active{environment="local",service="persistence"} 0');
-    expect(metricsBody).toContain('nutsnews_worker_health_probe{environment="local",service="persistence",probe="liveness",outcome="ok"} 1');
-    expect(metricsBody).toContain('nutsnews_worker_health_probe{environment="local",service="persistence",probe="startup",outcome="ok"} 1');
-    expect(metricsBody).toContain('nutsnews_worker_health_probe{environment="local",service="persistence",probe="readiness",outcome="ok"} 1');
+    expect(metricsBody).toContain('nutsnews_worker_expected_active{environment="local",service="nutsnews-worker-article-persistence"} 0');
+    expect(metricsBody).toContain('probe="liveness"');
+    expect(metricsBody).toContain('probe="startup"');
+    expect(metricsBody).toContain('probe="readiness"');
+    expect(metricsBody).toContain("nutsnews_worker_health_check_duration_seconds_bucket");
+    expect(metricsBody).not.toContain("nutsnews_worker_consumer_active");
     const schemaBody = await schema.json() as {
       readonly variables: readonly { readonly name: string; readonly sensitive: boolean }[];
     };

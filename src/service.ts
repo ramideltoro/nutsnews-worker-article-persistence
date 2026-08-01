@@ -13,11 +13,14 @@ import {
   createRuntimeInFlightDrainController,
   emitRuntimeTelemetry,
   runtimeNow,
+  type BrokerPublishCommand,
+  type BrokerPublishReceipt,
   type BrokerConsumerHandle,
   type BrokerLifecycle,
   type RuntimeHealthCheck,
   type RuntimeHealthReport,
   type RuntimeHealthProbeSet,
+  type RuntimeIdempotencyClaimReleaseResult,
   type RuntimeIdempotencyStore,
   type RuntimeMessageContext,
   type RuntimeMessageDelivery,
@@ -29,7 +32,8 @@ import {
 import type { PersistenceConfig } from "./config.js";
 import type {
   PersistenceDependencies,
-  PersistenceDependencyProbe
+  PersistenceDependencyProbe,
+  PersistenceBrokerTransport
 } from "./dependencies.js";
 import { sha256Digest } from "./digest.js";
 import { classifyPersistenceError } from "./errors.js";
@@ -62,6 +66,7 @@ export interface PersistenceService {
 }
 
 export function createPersistenceService(options: PersistenceServiceOptions): PersistenceService {
+  assertDependencyModeCompatibility(options.config, options.dependencies);
   const persistenceRoute = getWorkerRoute("persistence");
   const publicationRoute = getWorkerRoute("publication");
   const telemetry = bestEffortTelemetrySink(options.telemetry);
@@ -84,16 +89,35 @@ export function createPersistenceService(options: PersistenceServiceOptions): Pe
     ...(telemetry === undefined ? {} : {
       telemetry
     }),
-    handler: async (context) => {
+    handler: async (context, signal) => {
       try {
         return await drain.track(async () => {
+          signal.throwIfAborted();
           setInFlight(options.metrics, persistenceRoute.mainQueue.name, drain.inFlight);
           const dependencyStartedAtMs = options.dependencies.clock.now().getTime();
           const result = await options.dependencies.workHandler.handle(context, {
-            publish: (command) => broker.publish(command),
-            recordOutbox: (command, receipt) => options.dependencies.brokerOutbox.record(command, receipt),
-            withTransaction: (operation) => options.dependencies.finalShadowTransactions.withTransaction(operation)
+            signal,
+            publish: (command) => publishWithOwnershipSignal(
+              options.dependencies.brokerTransport,
+              broker,
+              command,
+              signal
+            ),
+            recordOutbox: (command, receipt) => runAbortableOperation(
+              signal,
+              () => options.dependencies.brokerOutbox.record(command, receipt)
+            ),
+            withTransaction: (operation) => runAbortableOperation(
+              signal,
+              () => options.dependencies.finalShadowTransactions.withTransaction(async (transaction) => {
+                signal.throwIfAborted();
+                const value = await operation(transaction);
+                signal.throwIfAborted();
+                return value;
+              })
+            )
           });
+          signal.throwIfAborted();
 
           await emitRuntimeTelemetry(telemetry, {
             name: "runtime.dependency.observed",
@@ -179,7 +203,7 @@ export function createPersistenceService(options: PersistenceServiceOptions): Pe
         stage: brokerConsumer.stage,
         cancel: async () => {
           await brokerConsumer.cancel();
-          setHealthProbe(options.metrics, "readiness", "unhealthy");
+          setHealthProbe(options.metrics, "readiness", "unhealthy", "rabbitmq-consumer");
         }
       };
       started = true;
@@ -212,6 +236,23 @@ export function createPersistenceService(options: PersistenceServiceOptions): Pe
   } satisfies PersistenceService;
 
   return service;
+}
+
+function assertDependencyModeCompatibility(
+  config: PersistenceConfig,
+  dependencies: PersistenceDependencies
+): void {
+  const expectedAdapterMode = config.dependencyMode === "production" ? "production" : "in_memory";
+  const expectedStateStoreMode = config.dependencyMode === "production" ? "postgresql" : "in_memory";
+
+  if (
+    dependencies.adapterMode !== expectedAdapterMode
+    || dependencies.stateStoreMode !== expectedStateStoreMode
+  ) {
+    throw new Error(
+      `Persistence dependency mode mismatch: ${config.dependencyMode} requires adapter=${expectedAdapterMode} and stateStore=${expectedStateStoreMode}.`
+    );
+  }
 }
 
 function bestEffortTelemetrySink(sink: RuntimeTelemetrySink | undefined): RuntimeTelemetrySink | undefined {
@@ -248,10 +289,11 @@ function setShutdownDraining(
 function setHealthProbe(
   metrics: PersistenceRuntimeMetricsSink | undefined,
   probe: PersistenceHealthProbe,
-  outcome: PersistenceHealthOutcome
+  outcome: PersistenceHealthOutcome,
+  check?: string
 ): void {
   if (isPersistenceMetrics(metrics)) {
-    runBestEffort(() => metrics.setHealthProbe(probe, outcome));
+    runBestEffort(() => metrics.setHealthProbe(probe, outcome, check));
   }
 }
 
@@ -314,12 +356,15 @@ function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
 interface PersistenceInputProcessorOptions {
   readonly dependencies: PersistenceDependencies;
   readonly telemetry?: RuntimeTelemetrySink;
-  handler(context: RuntimeMessageContext): Promise<{ readonly status: "ok" } | { readonly status: "retry"; readonly reason: string; readonly retryAfterMs?: number } | { readonly status: "terminal-failure"; readonly reason: string }>;
+  handler(
+    context: RuntimeMessageContext,
+    signal: AbortSignal
+  ): Promise<{ readonly status: "ok" } | { readonly status: "retry"; readonly reason: string; readonly retryAfterMs?: number } | { readonly status: "terminal-failure"; readonly reason: string }>;
 }
 
-// Runtime 0.5.0 validates payload definition.stage. Persistence instead owns all
-// schemas whose definition.consumer is persistence, including translationResult,
-// so this processor preserves consumer-aware validation and mirrors runtime events.
+// Persistence owns all schemas whose definition.consumer is persistence, including
+// translationResult, and adds payload-fingerprint quarantine before Runtime 1-style
+// token-aware idempotency transitions.
 function createPersistenceInputProcessor(options: PersistenceInputProcessorOptions) {
   return async (delivery: RuntimeMessageDelivery): Promise<RuntimeMessageProcessingResult> => {
     const receivedAt = delivery.receivedAt ?? runtimeNow(options.dependencies.clock);
@@ -433,49 +478,55 @@ function createPersistenceInputProcessor(options: PersistenceInputProcessorOptio
     }
 
     if (fingerprint.status === "conflict") {
-      try {
-        await options.dependencies.finalShadowTransactions.withTransaction(async (transaction) => {
-          await options.dependencies.finalShadowTransactions.recordQuarantine(transaction, createPayloadConflictQuarantineRecord(
-            envelope,
-            payloadResult.value,
-            payloadFingerprint,
-            fingerprint.existingFingerprint
-          ));
-        });
-      } catch {
-        const result = retryOrDlq(envelope, "quarantine-record-error");
-        await emitRetryOrDlq(
-          options.telemetry,
-          result,
-          options.dependencies.clock,
-          queue,
-          elapsedMs(options.dependencies.clock, startedAtMs)
-        );
-
-        return result;
-      }
-
-      const result = terminalResult(envelope, "idempotency-payload-conflict");
-      await emitRetryOrDlq(
-        options.telemetry,
-        result,
-        options.dependencies.clock,
+      return quarantinePayloadFingerprintConflict(
+        options,
+        envelope,
+        payloadResult.value,
+        payloadFingerprint,
+        fingerprint.existingFingerprint,
         queue,
-        elapsedMs(options.dependencies.clock, startedAtMs)
+        startedAtMs
       );
-
-      return result;
     }
 
     let claim: Awaited<ReturnType<RuntimeIdempotencyStore["claim"]>>;
 
     try {
-      claim = await options.dependencies.inboxStore.claim(envelope.idempotencyKey, {
-        envelope,
-        stage: "persistence",
-        receivedAt
-      });
+      claim = await options.dependencies.inboxStore.claim(
+        envelope.idempotencyKey,
+        {
+          envelope,
+          stage: "persistence",
+          receivedAt
+        },
+        payloadFingerprint
+      );
     } catch {
+      let racedFingerprint: Awaited<ReturnType<PersistenceDependencies["inboxStore"]["verifyPayloadFingerprint"]>>;
+
+      try {
+        racedFingerprint = await options.dependencies.inboxStore.verifyPayloadFingerprint(
+          envelope.idempotencyKey,
+          payloadFingerprint
+        );
+      } catch {
+        racedFingerprint = {
+          status: "accepted"
+        };
+      }
+
+      if (racedFingerprint.status === "conflict") {
+        return quarantinePayloadFingerprintConflict(
+          options,
+          envelope,
+          payloadResult.value,
+          payloadFingerprint,
+          racedFingerprint.existingFingerprint,
+          queue,
+          startedAtMs
+        );
+      }
+
       return completeProcessingFailure(
         options.telemetry,
         envelope,
@@ -521,6 +572,8 @@ function createPersistenceInputProcessor(options: PersistenceInputProcessorOptio
       return result;
     }
 
+    const claimToken = claim.claimToken;
+
     const context: RuntimeMessageContext = {
       envelope,
       payload: payloadResult.value,
@@ -528,15 +581,53 @@ function createPersistenceInputProcessor(options: PersistenceInputProcessorOptio
       receivedAt
     };
 
-    let result;
+    const claimLease = startPersistenceClaimLeaseHeartbeat(
+      options.dependencies.inboxStore,
+      envelope.idempotencyKey,
+      claimToken
+    );
+    let handlerOutcome:
+      | {
+          readonly status: "returned";
+          readonly result: Awaited<ReturnType<PersistenceInputProcessorOptions["handler"]>>;
+        }
+      | {
+          readonly status: "threw";
+          readonly error: unknown;
+        };
 
     try {
-      result = await options.handler(context);
+      handlerOutcome = {
+        status: "returned",
+        result: await options.handler(context, claimLease.signal)
+      };
     } catch (error: unknown) {
-      const classification = classifyPersistenceError(error);
+      handlerOutcome = {
+        status: "threw",
+        error
+      };
+    }
+
+    await claimLease.stop();
+
+    if (claimLease.ownershipLost) {
+      return completeProcessingFailure(
+        options.telemetry,
+        envelope,
+        "idempotency-lease-lost",
+        true,
+        options.dependencies.clock,
+        queue,
+        startedAtMs
+      );
+    }
+
+    if (handlerOutcome.status === "threw") {
+      const classification = classifyPersistenceError(handlerOutcome.error);
       const failureRecorded = await tryMarkFailed(
         options.dependencies.inboxStore,
         envelope,
+        claimToken,
         classification.reason,
         classification.retryable,
         options.dependencies.clock
@@ -565,27 +656,32 @@ function createPersistenceInputProcessor(options: PersistenceInputProcessorOptio
       );
     }
 
+    const result = handlerOutcome.result;
+
     if (result.status === "ok") {
       try {
-        await markCompleted(options.dependencies.inboxStore, envelope, options.dependencies.clock);
+        await markCompleted(options.dependencies.inboxStore, envelope, claimToken, options.dependencies.clock);
       } catch {
-        await tryMarkFailed(
+        const releaseResult = await tryReleaseClaim(
           options.dependencies.inboxStore,
           envelope,
+          claimToken,
           "idempotency-completion-error",
           true,
           options.dependencies.clock
         );
 
-        return completeProcessingFailure(
-          options.telemetry,
-          envelope,
-          "idempotency-completion-error",
-          true,
-          options.dependencies.clock,
-          queue,
-          startedAtMs
-        );
+        if (releaseResult === "release-error" || releaseResult.status !== "preserved-completed") {
+          return completeProcessingFailure(
+            options.telemetry,
+            envelope,
+            "idempotency-completion-error",
+            true,
+            options.dependencies.clock,
+            queue,
+            startedAtMs
+          );
+        }
       }
 
       await emitRuntimeTelemetry(options.telemetry, {
@@ -608,6 +704,7 @@ function createPersistenceInputProcessor(options: PersistenceInputProcessorOptio
       const failureRecorded = await tryMarkFailed(
         options.dependencies.inboxStore,
         envelope,
+        claimToken,
         result.reason,
         true,
         options.dependencies.clock
@@ -640,6 +737,7 @@ function createPersistenceInputProcessor(options: PersistenceInputProcessorOptio
     const failureRecorded = await tryMarkFailed(
       options.dependencies.inboxStore,
       envelope,
+      claimToken,
       result.reason,
       false,
       options.dependencies.clock
@@ -667,6 +765,170 @@ function createPersistenceInputProcessor(options: PersistenceInputProcessorOptio
       startedAtMs
     );
   };
+}
+
+async function quarantinePayloadFingerprintConflict(
+  options: PersistenceInputProcessorOptions,
+  envelope: WorkerMessageEnvelope,
+  payload: Readonly<Record<string, unknown>>,
+  payloadFingerprint: string,
+  existingFingerprint: string,
+  queue: string,
+  startedAtMs: number
+): Promise<RuntimeMessageProcessingResult> {
+  try {
+    await options.dependencies.finalShadowTransactions.withTransaction(async (transaction) => {
+      await options.dependencies.finalShadowTransactions.recordQuarantine(transaction, createPayloadConflictQuarantineRecord(
+        envelope,
+        payload,
+        payloadFingerprint,
+        existingFingerprint
+      ));
+    });
+  } catch {
+    const result = retryOrDlq(envelope, "quarantine-record-error");
+    await emitRetryOrDlq(
+      options.telemetry,
+      result,
+      options.dependencies.clock,
+      queue,
+      elapsedMs(options.dependencies.clock, startedAtMs)
+    );
+
+    return result;
+  }
+
+  const result = terminalResult(envelope, "idempotency-payload-conflict");
+  await emitRetryOrDlq(
+    options.telemetry,
+    result,
+    options.dependencies.clock,
+    queue,
+    elapsedMs(options.dependencies.clock, startedAtMs)
+  );
+
+  return result;
+}
+
+interface PersistenceClaimLeaseHeartbeat {
+  readonly ownershipLost: boolean;
+  readonly signal: AbortSignal;
+  stop(): Promise<void>;
+}
+
+function startPersistenceClaimLeaseHeartbeat(
+  store: PersistenceDependencies["inboxStore"],
+  idempotencyKey: string,
+  claimToken: string
+): PersistenceClaimLeaseHeartbeat {
+  const leaseMs = store.claimLeaseMs;
+  const controller = new AbortController();
+
+  if (leaseMs === undefined) {
+    return {
+      ownershipLost: false,
+      signal: controller.signal,
+      stop: () => Promise.resolve()
+    };
+  }
+
+  const intervalMs = Math.max(1, Math.min(60_000, Math.floor(leaseMs / 3)));
+  let ownershipLost = false;
+  let stopped = false;
+  let renewal: Promise<void> | undefined;
+  const loseOwnership = (reason: unknown): void => {
+    ownershipLost = true;
+
+    if (!controller.signal.aborted) {
+      controller.abort(reason);
+    }
+  };
+
+  const renew = (): Promise<void> => {
+    if (ownershipLost) {
+      return Promise.resolve();
+    }
+
+    if (renewal !== undefined) {
+      return renewal;
+    }
+
+    renewal = store.renewClaim(idempotencyKey, claimToken)
+      .then((result) => {
+        if (result.status === "not-owned") {
+          loseOwnership(new Error("Persistence idempotency claim is no longer owned."));
+        }
+      })
+      .catch((error: unknown) => {
+        loseOwnership(error);
+        throw error;
+      })
+      .finally(() => {
+        renewal = undefined;
+      });
+
+    return renewal;
+  };
+  const timer = setInterval(() => {
+    if (!stopped) {
+      void renew().catch(() => undefined);
+    }
+  }, intervalMs);
+  timer.unref();
+
+  return {
+    get ownershipLost(): boolean {
+      return ownershipLost;
+    },
+    signal: controller.signal,
+    async stop(): Promise<void> {
+      stopped = true;
+      clearInterval(timer);
+
+      try {
+        await renew();
+      } catch (error: unknown) {
+        loseOwnership(error);
+      }
+    }
+  };
+}
+
+async function runAbortableOperation<T>(
+  signal: AbortSignal,
+  operation: () => Promise<T>
+): Promise<T> {
+  signal.throwIfAborted();
+  const value = await operation();
+  signal.throwIfAborted();
+  return value;
+}
+
+async function publishWithOwnershipSignal(
+  transport: PersistenceBrokerTransport,
+  broker: BrokerLifecycle,
+  command: BrokerPublishCommand,
+  signal: AbortSignal
+): Promise<BrokerPublishReceipt> {
+  signal.throwIfAborted();
+
+  if (transport.publishWithSignal === undefined) {
+    return runAbortableOperation(signal, () => broker.publish(command));
+  }
+
+  if (broker.state !== "ready") {
+    throw new Error(`Broker lifecycle must be ready before use; current state is ${broker.state}.`);
+  }
+
+  const receipt = await transport.publishWithSignal(command, signal);
+  signal.throwIfAborted();
+  const route = getWorkerRoute(command.envelope.route);
+
+  if (receipt.exchange !== route.exchange || receipt.routingKey !== route.routingKey) {
+    throw new Error("Broker transport returned a publish receipt for the wrong route.");
+  }
+
+  return receipt;
 }
 
 function livenessCheck(): RuntimeHealthCheck {
@@ -1019,11 +1281,13 @@ function envelopeTelemetryFields(
 async function markCompleted(
   store: RuntimeIdempotencyStore,
   envelope: WorkerMessageEnvelope,
+  claimToken: string,
   clock: PersistenceDependencies["clock"]
 ): Promise<void> {
   await store.markCompleted(envelope.idempotencyKey, {
     completedAt: runtimeNow(clock),
     messageId: envelope.messageId,
+    claimToken,
     stage: "persistence"
   });
 }
@@ -1031,6 +1295,7 @@ async function markCompleted(
 async function markFailed(
   store: RuntimeIdempotencyStore,
   envelope: WorkerMessageEnvelope,
+  claimToken: string,
   reason: string,
   retryable: boolean,
   clock: PersistenceDependencies["clock"]
@@ -1038,6 +1303,7 @@ async function markFailed(
   await store.markFailed(envelope.idempotencyKey, {
     failedAt: runtimeNow(clock),
     messageId: envelope.messageId,
+    claimToken,
     stage: "persistence",
     reason,
     retryable
@@ -1047,15 +1313,38 @@ async function markFailed(
 async function tryMarkFailed(
   store: RuntimeIdempotencyStore,
   envelope: WorkerMessageEnvelope,
+  claimToken: string,
   reason: string,
   retryable: boolean,
   clock: PersistenceDependencies["clock"]
 ): Promise<boolean> {
   try {
-    await markFailed(store, envelope, reason, retryable, clock);
+    await markFailed(store, envelope, claimToken, reason, retryable, clock);
     return true;
   } catch {
     return false;
+  }
+}
+
+async function tryReleaseClaim(
+  store: RuntimeIdempotencyStore,
+  envelope: WorkerMessageEnvelope,
+  claimToken: string,
+  reason: string,
+  retryable: boolean,
+  clock: PersistenceDependencies["clock"]
+): Promise<RuntimeIdempotencyClaimReleaseResult | "release-error"> {
+  try {
+    return await store.releaseClaim(envelope.idempotencyKey, {
+      failedAt: runtimeNow(clock),
+      messageId: envelope.messageId,
+      claimToken,
+      stage: "persistence",
+      reason,
+      retryable
+    });
+  } catch {
+    return "release-error";
   }
 }
 

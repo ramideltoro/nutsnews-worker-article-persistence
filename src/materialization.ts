@@ -64,6 +64,7 @@ export class FinalShadowMaterializationHandler implements PersistenceWorkHandler
   constructor(private readonly dependencies: PersistenceDependencies) {}
 
   async handle(context: RuntimeMessageContext, tools: PersistenceWorkTools): Promise<RuntimeHandlerResult> {
+    tools.signal.throwIfAborted();
     const parsed = parseFinalMaterializationRequest(context);
 
     if (!parsed.ok) {
@@ -75,7 +76,10 @@ export class FinalShadowMaterializationHandler implements PersistenceWorkHandler
     }
 
     const request = parsed.request;
-    const inputs = await this.dependencies.stageViewReader.readFinalMaterializationInputs(request);
+    const inputs = await runPersistenceWorkOperation(
+      tools,
+      () => this.dependencies.stageViewReader.readFinalMaterializationInputs(request)
+    );
     const inputValidation = validateStageInputs(request, inputs);
 
     if (inputValidation !== undefined) {
@@ -99,34 +103,46 @@ export class FinalShadowMaterializationHandler implements PersistenceWorkHandler
     };
 
     const writeResult = await tools.withTransaction(async (transaction) => {
-      const backendResult = await this.dependencies.backendApiClient.recordShadowAggregate(backendCommand);
+      const backendResult = await runPersistenceWorkOperation(
+        tools,
+        () => this.dependencies.backendApiClient.recordShadowAggregate(backendCommand)
+      );
 
       if (backendResult.status === "conflict" || backendResult.status === "stale") {
-        await this.dependencies.finalShadowTransactions.recordQuarantine(transaction, createQuarantineRecord(
-          context,
-          backendResult.reason,
-          request,
-          {
-            backendResult: backendResult.status
-          }
-        ));
+        await runPersistenceWorkOperation(
+          tools,
+          () => this.dependencies.finalShadowTransactions.recordQuarantine(transaction, createQuarantineRecord(
+            context,
+            backendResult.reason,
+            request,
+            {
+              backendResult: backendResult.status
+            }
+          ))
+        );
         return {
           status: backendResult.status,
           reason: backendResult.reason
         } as const;
       }
 
-      const result = await this.dependencies.finalShadowTransactions.recordFinalMaterialization(transaction, record);
+      const result = await runPersistenceWorkOperation(
+        tools,
+        () => this.dependencies.finalShadowTransactions.recordFinalMaterialization(transaction, record)
+      );
 
       if (result.status === "conflict" || result.status === "stale") {
-        await this.dependencies.finalShadowTransactions.recordQuarantine(transaction, createQuarantineRecord(
-          context,
-          result.reason,
-          request,
-          {
-            finalShadowResult: result.status
-          }
-        ));
+        await runPersistenceWorkOperation(
+          tools,
+          () => this.dependencies.finalShadowTransactions.recordQuarantine(transaction, createQuarantineRecord(
+            context,
+            result.reason,
+            request,
+            {
+              finalShadowResult: result.status
+            }
+          ))
+        );
       }
 
       return result;
@@ -160,12 +176,15 @@ export class FinalShadowMaterializationHandler implements PersistenceWorkHandler
     request?: PersistenceFinalMaterializationRequest
   ): Promise<void> {
     await tools.withTransaction(async (transaction) => {
-      await this.dependencies.finalShadowTransactions.recordQuarantine(transaction, createQuarantineRecord(
-        context,
-        reason,
-        request,
-        diagnosticMetadata
-      ));
+      await runPersistenceWorkOperation(
+        tools,
+        () => this.dependencies.finalShadowTransactions.recordQuarantine(transaction, createQuarantineRecord(
+          context,
+          reason,
+          request,
+          diagnosticMetadata
+        ))
+      );
     });
   }
 
@@ -173,13 +192,23 @@ export class FinalShadowMaterializationHandler implements PersistenceWorkHandler
     tools: PersistenceWorkTools,
     command: PersistenceFinalMaterializationRecord["publicationReadinessCommand"]
   ): Promise<void> {
-    if (await this.dependencies.brokerOutbox.hasReceipt(command)) {
+    if (await runPersistenceWorkOperation(tools, () => this.dependencies.brokerOutbox.hasReceipt(command))) {
       return;
     }
 
     const receipt = await tools.publish(command);
     await tools.recordOutbox(command, receipt);
   }
+}
+
+async function runPersistenceWorkOperation<T>(
+  tools: PersistenceWorkTools,
+  operation: () => T | Promise<T>
+): Promise<T> {
+  tools.signal.throwIfAborted();
+  const value = await operation();
+  tools.signal.throwIfAborted();
+  return value;
 }
 
 function parseFinalMaterializationRequest(context: RuntimeMessageContext): ParseResult {

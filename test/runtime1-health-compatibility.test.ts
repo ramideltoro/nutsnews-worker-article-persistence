@@ -70,7 +70,7 @@ describe("persistence Runtime1 health metric compatibility", () => {
     runtime1Delegate.health.clear();
   });
 
-  it("keeps one custom health-probe family when the delegate supports the Runtime1 family", async () => {
+  it("keeps one Runtime-owned health-probe family and forwards health evaluations", async () => {
     const metrics = createPersistencePrometheusTelemetrySink({
       identity: {
         service: "nutsnews-worker-article-persistence",
@@ -106,7 +106,11 @@ describe("persistence Runtime1 health metric compatibility", () => {
     const healthSeries = healthSamples.map((line) => line.slice(0, line.lastIndexOf(" ")));
 
     expect(runtime1Delegate.forwardedEventNames).toEqual([
-      "runtime.message.started"
+      "runtime.health.evaluated",
+      "runtime.health.evaluated",
+      "runtime.health.evaluated",
+      "runtime.message.started",
+      "runtime.health.evaluated"
     ]);
     expect(lines.filter((line) => line.startsWith("# HELP nutsnews_worker_health_probe "))).toHaveLength(1);
     expect(lines.filter((line) => line === "# TYPE nutsnews_worker_health_probe gauge")).toHaveLength(1);

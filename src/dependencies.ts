@@ -37,10 +37,23 @@ export type PersistenceInboxFingerprintResult =
       readonly existingFingerprint: string;
     };
 
+export type PersistenceInboxClaimRenewalResult = {
+  readonly status: "renewed";
+} | {
+  readonly status: "not-owned";
+};
+
 export interface PersistenceInboxStore extends RuntimeIdempotencyStore {
   readonly name: string;
+  readonly claimLeaseMs?: number;
   probe(): PersistenceDependencyProbe | Promise<PersistenceDependencyProbe>;
   verifyPayloadFingerprint(idempotencyKey: string, fingerprint: string): Promise<PersistenceInboxFingerprintResult>;
+  renewClaim(idempotencyKey: string, claimToken: string): Promise<PersistenceInboxClaimRenewalResult>;
+  claim(
+    idempotencyKey: string,
+    context: Parameters<RuntimeIdempotencyStore["claim"]>[1],
+    payloadFingerprint?: string
+  ): ReturnType<RuntimeIdempotencyStore["claim"]>;
 }
 
 export interface PersistenceDatabaseTransaction {
@@ -111,6 +124,7 @@ export interface PersistenceBackendWorkerApiClient {
 }
 
 export interface PersistenceWorkTools {
+  readonly signal: AbortSignal;
   publish(command: BrokerPublishCommand): Promise<BrokerPublishReceipt>;
   recordOutbox(command: BrokerPublishCommand, receipt: BrokerPublishReceipt): Promise<void>;
   withTransaction<T>(operation: (transaction: PersistenceDatabaseTransaction) => Promise<T>): Promise<T>;
@@ -121,14 +135,23 @@ export interface PersistenceWorkHandler {
   handle(context: RuntimeMessageContext, tools: PersistenceWorkTools): RuntimeHandlerResult | Promise<RuntimeHandlerResult>;
 }
 
+export interface PersistenceBrokerTransport extends RuntimeBrokerTransport {
+  publishWithSignal?(
+    command: BrokerPublishCommand,
+    signal: AbortSignal
+  ): Promise<BrokerPublishReceipt>;
+}
+
 export interface PersistenceDependencies {
+  readonly adapterMode: "in_memory" | "production";
+  readonly stateStoreMode: "in_memory" | "postgresql";
   readonly clock: RuntimeClock;
   readonly inboxStore: PersistenceInboxStore;
   readonly finalShadowTransactions: PersistenceFinalShadowTransactionRunner;
   readonly stageViewReader: PersistenceStageViewReader;
   readonly brokerOutbox: PersistenceBrokerOutbox;
   readonly feedHealthProjectionStore: PersistenceFeedHealthProjectionStore;
-  readonly brokerTransport: RuntimeBrokerTransport;
+  readonly brokerTransport: PersistenceBrokerTransport;
   readonly backendApiClient: PersistenceBackendWorkerApiClient;
   readonly workHandler: PersistenceWorkHandler;
 }

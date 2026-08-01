@@ -1,5 +1,6 @@
 import {
   RUNTIME_ALLOWED_METRIC_LABELS,
+  RUNTIME_DURATION_HISTOGRAM_BUCKETS_SECONDS,
   type RuntimeTelemetryEvent
 } from "@ramideltoro/nutsnews-worker-runtime";
 import {
@@ -105,6 +106,8 @@ describe("persistence Prometheus telemetry", () => {
     }
 
     expect(output).toContain('nutsnews_worker_uplift_stage_latency_seconds_bucket{environment="production",service="persistence",le="0.01"} 1');
+    expect(output).toContain('nutsnews_worker_uplift_stage_latency_seconds_bucket{environment="production",service="persistence",le="0.005"} 1');
+    expect(output).toContain('nutsnews_worker_uplift_stage_latency_seconds_bucket{environment="production",service="persistence",le="0.025"} 1');
     expect(output).toContain('nutsnews_worker_uplift_stage_latency_seconds_bucket{environment="production",service="persistence",le="0.05"} 2');
     expect(output).toContain('nutsnews_worker_uplift_stage_latency_seconds_bucket{environment="production",service="persistence",le="30"} 3');
     expect(output).toContain('nutsnews_worker_uplift_stage_latency_seconds_bucket{environment="production",service="persistence",le="60"} 4');
@@ -174,6 +177,11 @@ describe("persistence Prometheus telemetry", () => {
       }
     });
     expectProbe(context.metrics.collect(), "readiness", "unhealthy");
+    expectHealthCheck(context.metrics.collect(), "readiness", "rabbitmq-consumer", "unhealthy");
+    expect(metricSeries(context.metrics.collect(), "nutsnews_worker_consumers")).toEqual([
+      expect.stringMatching(/nutsnews_worker_consumers\{.*queue="nutsnews\.worker\.persistence\.v1".*\} 0$/u)
+    ]);
+    expect(context.metrics.collect()).not.toContain("nutsnews_worker_consumer_active");
 
     await context.metrics.emit({
       name: "runtime.broker.consumer_state_changed",
@@ -188,12 +196,16 @@ describe("persistence Prometheus telemetry", () => {
       }
     });
     expectProbe(context.metrics.collect(), "readiness", "unhealthy");
+    expect(metricSeries(context.metrics.collect(), "nutsnews_worker_consumers")).toEqual([
+      expect.stringMatching(/nutsnews_worker_consumers\{.*queue="nutsnews\.worker\.persistence\.v1".*\} 1$/u)
+    ]);
 
     await context.service.health.readiness();
     expectProbe(context.metrics.collect(), "readiness", "ok");
 
     await context.service.consumer?.cancel();
     expectProbe(context.metrics.collect(), "readiness", "unhealthy");
+    expectHealthCheck(context.metrics.collect(), "readiness", "rabbitmq-consumer", "unhealthy");
 
     await context.service.stop();
     expectProbe(context.metrics.collect(), "liveness", "ok");
@@ -411,12 +423,111 @@ describe("persistence Prometheus telemetry", () => {
       await service.stop();
     }
   });
+
+  it("exports each Runtime-owned health check and duration family exactly once", async () => {
+    const metrics = createPersistencePrometheusTelemetrySink({
+      identity: {
+        service: "nutsnews-worker-article-persistence",
+        version: "0.1.0",
+        environment: "production",
+        host: "backend.nutsnews.com"
+      },
+      cardinality: {
+        healthChecks: [
+          "persistence-inbox"
+        ]
+      }
+    });
+
+    await metrics.emit({
+      name: "runtime.health.evaluated",
+      level: "info",
+      at: "2026-08-01T00:00:01.000Z",
+      outcome: "ok",
+      attributes: {
+        probe: "readiness",
+        checks: [
+          {
+            name: "persistence-inbox",
+            status: "ok",
+            critical: true,
+            durationMs: 5
+          }
+        ]
+      }
+    });
+
+    const output = metrics.collect();
+    const lines = output.split("\n");
+    const healthCheckSamples = lines.filter((line) => line.startsWith("nutsnews_worker_health_check{"));
+    const durationSamples = metricSeries(output, "nutsnews_worker_health_check_duration_seconds");
+
+    expect(lines.filter((line) => line.startsWith("# HELP nutsnews_worker_health_check "))).toHaveLength(1);
+    expect(lines.filter((line) => line === "# TYPE nutsnews_worker_health_check gauge")).toHaveLength(1);
+    expect(healthCheckSamples).toHaveLength(3);
+    expect(new Set(healthCheckSamples.map(seriesWithoutValue)).size).toBe(healthCheckSamples.length);
+    expect(healthCheckSamples).toContain('nutsnews_worker_health_check{environment="production",host="backend.nutsnews.com",service="nutsnews-worker-article-persistence",version="0.1.0",outcome="ok",probe="readiness",check="persistence-inbox"} 1');
+    expect(lines.filter((line) => line.startsWith("# HELP nutsnews_worker_health_check_duration_seconds "))).toHaveLength(1);
+    expect(lines.filter((line) => line === "# TYPE nutsnews_worker_health_check_duration_seconds histogram")).toHaveLength(1);
+    expect(durationSamples).toHaveLength(RUNTIME_DURATION_HISTOGRAM_BUCKETS_SECONDS.length + 3);
+    expect(new Set(durationSamples.map(seriesWithoutValue)).size).toBe(durationSamples.length);
+    expect(durationSamples).toContain('nutsnews_worker_health_check_duration_seconds_bucket{environment="production",host="backend.nutsnews.com",service="nutsnews-worker-article-persistence",version="0.1.0",probe="readiness",check="persistence-inbox",le="0.005"} 1');
+    expect(durationSamples).toContain('nutsnews_worker_health_check_duration_seconds_count{environment="production",host="backend.nutsnews.com",service="nutsnews-worker-article-persistence",version="0.1.0",probe="readiness",check="persistence-inbox"} 1');
+  });
+
+  it("updates Runtime last-success time for accepted and duplicate outcomes without moving backward", async () => {
+    const metrics = createPersistencePrometheusTelemetrySink({
+      identity: {
+        service: "nutsnews-worker-article-persistence",
+        version: "0.1.0",
+        environment: "production",
+        host: "backend.nutsnews.com"
+      }
+    });
+    const firstSuccessAt = "2026-08-01T00:00:10.900Z";
+    const olderDuplicateAt = "2026-08-01T00:00:05.000Z";
+    const latestDuplicateAt = "2026-08-01T00:00:30.100Z";
+
+    expect(metricSeries(metrics.collect(), "nutsnews_worker_last_success_timestamp_seconds")).toHaveLength(0);
+
+    await metrics.emit({
+      ...completion("runtime.message.accepted", "success", 5),
+      at: firstSuccessAt
+    });
+    expect(metricSeries(metrics.collect(), "nutsnews_worker_last_success_timestamp_seconds")).toEqual([
+      `nutsnews_worker_last_success_timestamp_seconds{environment="production",service="nutsnews-worker-article-persistence"} ${String(Math.floor(Date.parse(firstSuccessAt) / 1_000))}`
+    ]);
+
+    await metrics.emit({
+      ...completion("runtime.message.duplicate", "duplicate", 5),
+      at: olderDuplicateAt
+    });
+    expect(metricSeries(metrics.collect(), "nutsnews_worker_last_success_timestamp_seconds")).toEqual([
+      `nutsnews_worker_last_success_timestamp_seconds{environment="production",service="nutsnews-worker-article-persistence"} ${String(Math.floor(Date.parse(firstSuccessAt) / 1_000))}`
+    ]);
+
+    await metrics.emit({
+      ...completion("runtime.message.retry", "retry", 5),
+      at: "2026-08-01T00:01:00.000Z"
+    });
+    await metrics.emit({
+      ...completion("runtime.message.duplicate", "duplicate", 5),
+      at: latestDuplicateAt
+    });
+    expect(metricSeries(metrics.collect(), "nutsnews_worker_last_success_timestamp_seconds")).toEqual([
+      `nutsnews_worker_last_success_timestamp_seconds{environment="production",service="nutsnews-worker-article-persistence"} ${String(Math.floor(Date.parse(latestDuplicateAt) / 1_000))}`
+    ]);
+  });
 });
 
 function metricSeries(output: string, family: string): string[] {
   return output
     .split("\n")
     .filter((line) => line.startsWith(family) && !line.startsWith(`# ${family}`));
+}
+
+function seriesWithoutValue(series: string): string {
+  return series.slice(0, series.lastIndexOf(" "));
 }
 
 function createProbeContext() {
@@ -458,12 +569,30 @@ function expectProbe(
     "degraded",
     "unhealthy"
   ] as const;
-  const values = outcomes.map((outcome) => output.includes(
-    `nutsnews_worker_health_probe{environment="test",service="persistence",probe="${probe}",outcome="${outcome}"} 1`
-  ) ? 1 : 0);
+  const probeSamples = output.split("\n").filter((line) => line.startsWith("nutsnews_worker_health_probe{")
+    && line.includes('environment="test"')
+    && line.includes('service="nutsnews-worker-article-persistence"')
+    && line.includes(`probe="${probe}"`));
+  const values = outcomes.map((outcome) => probeSamples.some((line) => line.includes(`outcome="${outcome}"`)
+    && line.endsWith(" 1")) ? 1 : 0);
 
+  expect(probeSamples).toHaveLength(3);
   expect(values.reduce<number>((sum, value) => sum + value, 0)).toBe(1);
   expect(values[outcomes.indexOf(expected)]).toBe(1);
+}
+
+function expectHealthCheck(
+  output: string,
+  probe: "liveness" | "startup" | "readiness",
+  check: string,
+  expected: "ok" | "degraded" | "unhealthy"
+): void {
+  const samples = output.split("\n").filter((line) => line.startsWith("nutsnews_worker_health_check{")
+    && line.includes(`probe="${probe}"`)
+    && line.includes(`check="${check}"`));
+
+  expect(samples).toHaveLength(3);
+  expect(samples.filter((line) => line.includes(`outcome="${expected}"`) && line.endsWith(" 1"))).toHaveLength(1);
 }
 
 function persistenceDelivery(

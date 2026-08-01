@@ -90,6 +90,26 @@ describe("createPersistenceApplication", () => {
     expect(process.listenerCount("SIGINT")).toBe(signalListenerCounts.SIGINT);
     expect(process.listenerCount("SIGTERM")).toBe(signalListenerCounts.SIGTERM);
   });
+
+  it("rejects injected in-memory adapters for a production configuration", () => {
+    const config = loadPersistenceConfig({
+      HOSTNAME: "persistence-production-adapter-test",
+      NUTSNEWS_ENVIRONMENT: "production",
+      NUTSNEWS_PERSISTENCE_DEPENDENCY_MODE: "production",
+      NUTSNEWS_PERSISTENCE_BUILD_REVISION: "0123456789abcdef0123456789abcdef01234567",
+      NUTSNEWS_PERSISTENCE_DATABASE_URL: "postgres://example.invalid/persistence",
+      NUTSNEWS_PERSISTENCE_RABBITMQ_URL: "amqp://example.invalid",
+      NUTSNEWS_PERSISTENCE_BACKEND_API_BASE_URL: "https://backend.example.invalid/worker",
+      NUTSNEWS_PERSISTENCE_BACKEND_API_TOKEN: "test-placeholder",
+      NUTSNEWS_PERSISTENCE_TELEMETRY_LOGS: "silent"
+    });
+
+    expect(() => createPersistenceApplication(config, {
+      dependencies: createLocalPersistenceDependencies()
+    })).toThrow(
+      "production requires adapter=production and stateStore=postgresql"
+    );
+  });
 });
 
 function applicationConfig() {

@@ -209,6 +209,7 @@ describe("persistence transaction, replay, and DLQ safety", () => {
         "host",
         "service",
         "version",
+        "stage",
         "queue",
         "outcome"
       ]);

@@ -84,6 +84,7 @@ export class PersistenceConfigError extends Error {
 export function loadPersistenceConfig(env: NodeJS.ProcessEnv = process.env): PersistenceConfig {
   const issues: string[] = [];
   const dependencyMode = parseDependencyMode(env.NUTSNEWS_PERSISTENCE_DEPENDENCY_MODE, issues);
+  const environment = nonEmpty(env.NUTSNEWS_ENVIRONMENT, "local");
   const dependencies = {
     databaseConfigured: hasValue(env.NUTSNEWS_PERSISTENCE_DATABASE_URL),
     rabbitmqConfigured: hasValue(env.NUTSNEWS_PERSISTENCE_RABBITMQ_URL),
@@ -98,6 +99,10 @@ export function loadPersistenceConfig(env: NodeJS.ProcessEnv = process.env): Per
     requireConfigured("NUTSNEWS_PERSISTENCE_BACKEND_API_TOKEN", dependencies.backendApiCredentialConfigured, issues);
   }
 
+  if (environment.toLowerCase() === "production" && dependencyMode !== "production") {
+    issues.push("NUTSNEWS_PERSISTENCE_DEPENDENCY_MODE must be production when NUTSNEWS_ENVIRONMENT=production so the PostgreSQL state store and external adapters cannot run in test mode.");
+  }
+
   const buildRevision = parseBuildRevision(env.NUTSNEWS_PERSISTENCE_BUILD_REVISION, dependencyMode, issues);
 
   const concurrency = parseInteger(env.NUTSNEWS_PERSISTENCE_CONCURRENCY, "NUTSNEWS_PERSISTENCE_CONCURRENCY", 2, 1, 16, issues);
@@ -105,7 +110,7 @@ export function loadPersistenceConfig(env: NodeJS.ProcessEnv = process.env): Per
   const config: PersistenceConfig = {
     serviceName: PERSISTENCE_SERVICE_NAME,
     serviceVersion: PERSISTENCE_SERVICE_VERSION,
-    environment: nonEmpty(env.NUTSNEWS_ENVIRONMENT, "local"),
+    environment,
     buildRevision,
     host: nonEmpty(env.HOSTNAME, os.hostname()),
     http: {
